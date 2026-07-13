@@ -38,7 +38,8 @@ docker pull quay.io/ascend/vllm-ascend:{{ vllm_ascend_version }}
 ```
 
 !!! note
-The Qwen3-ASR-1.7B model is first supported in v0.19.1rc1. This document is validated and written based on vLLM-Ascend v0.22.1rc. All v0.22.1rc and later versions can run stably. To use the latest features, it is recommended to use the latest release candidate or official version.
+
+    The Qwen3-ASR-1.7B model is first supported in v0.19.1rc1. This document is validated and written based on vLLM-Ascend v0.22.1rc. All v0.22.1rc and later versions can run stably. To use the latest features, it is recommended to use the latest release candidate or official version.
 
 **Docker Run:**
 
