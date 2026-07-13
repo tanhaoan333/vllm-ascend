@@ -281,7 +281,7 @@ Expected result: HTTP 200 with a JSON response containing the `choices` field wi
 
 ## 7 Accuracy Evaluation
 
-### Using EvalScope
+### 7.1 Using EvalScope
 
 As an example, take the `aishell` dataset as a test dataset, and run accuracy evaluation of `Qwen3-ASR-1.7B` in online mode.
 
@@ -295,16 +295,17 @@ After all samples were processed, transcription quality was measured using:
     +=============================+============+==========+==========+=========+=========+=========+
     | Qwen3-Omni-30B-A3B-Thinking | aishell    | mean_acc |   7176   |  0.0155 |  0.0000 | 0.5000  |
     +-----------------------------+------------+----------+----------+---------+---------+---------+
-    ```
+ ```
 
 - WER (Word Error Rate) for word-level recognition accuracy
 - CER (Character Error Rate) for character-level recognition accuracy
 
-### Remarks
+### 7.2 Remarks
 
 This result reflects end-to-end serving performance, including audio preprocessing, request construction, API communication, inference, and response parsing. Actual performance may vary depending on hardware, concurrency, audio length, and deployment configuration.
 
 Further benchmarking is recommended for latency distribution, concurrent throughput, long-audio scenarios, and system resource utilization.
+
 
 ## 8 Performance Evaluation
 
