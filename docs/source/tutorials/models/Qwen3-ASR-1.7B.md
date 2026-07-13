@@ -6,6 +6,8 @@ The released Qwen3-ASR-1.7B is a lightweight, high-performance automatic speech 
 
 This document will show the main verification steps of the model, including supported features, feature configuration, environment preparation, single-node deployment, accuracy and performance evaluation.
 
+The Qwen3-ASR-1.7B model is first supported in v0.19.1rc1. This document is validated and written based on vLLM-Ascend v0.22.1rc. All v0.22.1rc and later versions can run stably. To use the latest features, it is recommended to use the latest release candidate or official version.
+
 ## 2 Supported Features
 
 Please refer to [Supported Features List](https://docs.vllm.ai/projects/ascend/zh-cn/latest/user_guide/support_matrix/supported_models.html) to get the model's supported feature matrix.
