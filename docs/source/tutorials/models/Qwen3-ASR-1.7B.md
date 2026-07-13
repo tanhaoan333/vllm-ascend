@@ -293,7 +293,7 @@ After all samples were processed, transcription quality was measured using:
     +-----------------------------+------------+----------+----------+---------+---------+---------+
     | Model                       | Dataset    | Metric   |   Num    | mean WER| min WER | max WER |
     +=============================+============+==========+==========+=========+=========+=========+
-    | Qwen3-Omni-30B-A3B-Thinking | aishell    | mean_acc |   7176   |  7176   |  0.0000 | 0.5000  |
+    | Qwen3-Omni-30B-A3B-Thinking | aishell    | mean_acc |   7176   |  0.0155 |  0.0000 | 0.5000  |
     +-----------------------------+------------+----------+----------+---------+---------+---------+
     ```
 
@@ -305,3 +305,8 @@ After all samples were processed, transcription quality was measured using:
 This result reflects end-to-end serving performance, including audio preprocessing, request construction, API communication, inference, and response parsing. Actual performance may vary depending on hardware, concurrency, audio length, and deployment configuration.
 
 Further benchmarking is recommended for latency distribution, concurrent throughput, long-audio scenarios, and system resource utilization.
+
+## 8 Performance Evaluation
+
+### Using vLLM Benchmark
+
