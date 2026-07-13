@@ -281,7 +281,7 @@ Expected result: HTTP 200 with a JSON response containing the `choices` field wi
 
 ## 7 Accuracy Evaluation
 
-### 7.1 Using EvalScope
+### 7.1 Using Scripts
 
 As an example, take the `aishell` dataset as a test dataset, and run accuracy evaluation of `Qwen3-ASR-1.7B` in online mode.
 
@@ -309,6 +309,17 @@ Further benchmarking is recommended for latency distribution, concurrent through
 
 ## 8 Performance Evaluation
 
-### Using vLLM Benchmark
+### Using Scripts
 
+As an example, take the same `wav` case for input, using benchmark script to test performance.
 
+Refer to [test](https://gitcode.com/weixin_44928100/vllm-ascend-qwen3-asr/blob/main/test.py)
+
+```bash
+--- Concurrency: 8 ---
+Total Requests: 8
+TTFT: avg=63.7ms, min=51.4ms, max=69.8ms
+TPOT: avg=9.5ms, min=9.4ms, max=9.6ms
+E2E: avg=253.6ms, min=244.2ms, max=257.6ms
+Avg Tokens: 21
+```
