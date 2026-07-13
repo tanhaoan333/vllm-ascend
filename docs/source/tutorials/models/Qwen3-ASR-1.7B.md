@@ -286,7 +286,7 @@ Expected result: HTTP 200 with a JSON response containing the `choices` field wi
 As an example, take the `aishell` dataset as a test dataset, and run accuracy evaluation of `Qwen3-ASR-1.7B` in online mode.
 
 1. Refer to [Download aishell](https://www.modelscope.cn/datasets/modelscope/speech_asr_aishell1_testsets)
-2. Because vLLM Benchmark haven't support aishell dataset, you can refer to the following script to run the benchmark. [script](https://gitcode.com/weixin_44928100/vllm-ascend-qwen3-asr/blob/main/test.py)
+2. Because vLLM Benchmark haven't support aishell dataset, you can refer to the following script to run the benchmark. [script](https://github.com/tanhaoan333/vllm-ascend/blob/doc/docs/source/tutorials/models/aisell.py)
 After all samples were processed, transcription quality was measured using:
 
  ```bash
