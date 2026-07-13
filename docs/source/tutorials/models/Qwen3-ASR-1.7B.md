@@ -286,8 +286,16 @@ Expected result: HTTP 200 with a JSON response containing the `choices` field wi
 As an example, take the `aishell` dataset as a test dataset, and run accuracy evaluation of `Qwen3-ASR-1.7B` in online mode.
 
 1. Refer to [Download aishell](https://www.modelscope.cn/datasets/modelscope/speech_asr_aishell1_testsets)
-
+2. Because vLLM Benchmark haven't support aishell dataset, you can refer to the following script to run the benchmark. [script](https://gitcode.com/weixin_44928100/vllm-ascend-qwen3-asr/blob/main/test.py)
 After all samples were processed, transcription quality was measured using:
+
+ ```bash
+    +-----------------------------+------------+----------+----------+---------+---------+---------+
+    | Model                       | Dataset    | Metric   |   Num    | mean WER| min WER | max WER |
+    +=============================+============+==========+==========+=========+=========+=========+
+    | Qwen3-Omni-30B-A3B-Thinking | aishell    | mean_acc |   7176   |  7176   |  0.0000 | 0.5000  |
+    +-----------------------------+------------+----------+----------+---------+---------+---------+
+    ```
 
 - WER (Word Error Rate) for word-level recognition accuracy
 - CER (Character Error Rate) for character-level recognition accuracy
