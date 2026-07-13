@@ -285,6 +285,8 @@ Expected result: HTTP 200 with a JSON response containing the `choices` field wi
 
 As an example, take the `aishell` dataset as a test dataset, and run accuracy evaluation of `Qwen3-ASR-1.7B` in online mode.
 
+1. Refer to [Download aishell](https://www.modelscope.cn/datasets/modelscope/speech_asr_aishell1_testsets)
+
 After all samples were processed, transcription quality was measured using:
 
 - WER (Word Error Rate) for word-level recognition accuracy
