@@ -29,6 +29,99 @@ Ascend 上 SDPA 会 lower 成在辅助流上启动的 kernel，**破坏图捕获
 
 ---
 
+## 0.1 流程架构图总览
+
+> 本节用图把入图的全景一次讲清：①各模块如何分流到两种范式；②范式 A / B 各自的生命周期；③范式 B 最关键、也最难理解的**双流事件同步时序**。文字细节见后续 §1–§8。
+
+### 图 1：模块分发架构（谁走范式 A、谁走范式 B）
+
+```mermaid
+flowchart TD
+    START["请求进入 UniDiTAR forward"] --> ISNPU{"NPU 且<br/>非 enforce_eager?"}
+    ISNPU -- 否 --> EAGER["逐算子 eager<br/>(host launch 开销)"]
+    ISNPU -- 是 --> KIND{"该子模块的<br/>形状是否恒定/可分桶?"}
+
+    KIND -- "形状恒定 / 可 padding 成定长<br/>(KV 不随步增长)" --> PA["范式 A：定长整图 bake"]
+    KIND -- "KV 每步增长<br/>FIA 启动参数每步变" --> PB["范式 B：graph_task_group 可更新 task"]
+
+    PA --> PA_MODS["MingDiT / MingAggregator /<br/>Conformer / AudioVAE-enc /<br/>Whisper route-A prefill / Whisper EMB-prefill"]
+    PB --> PB_MODS["Whisper 语义编码器 AR 解码步"]
+
+    PA_MODS --> FIA["底层注意力：<br/>torch_npu.npu_fused_infer_attention_score (FIA)"]
+    PB_MODS --> FIA
+    FIA --> REPLAY["graph.replay() 一次跑完整段前向"]
+```
+
+### 图 2：范式 A 生命周期（capture 一次 → replay 多次）
+
+```mermaid
+flowchart LR
+    subgraph LOAD["load / 首次遇到该桶（懒式）"]
+        E["enable_npu_graph()<br/>只置位 _npu_graph_wanted"] --> BUCKET["分桶：batch 取 2^n<br/>seq 取 128 倍数"]
+        BUCKET --> ALLOC["分配静态输入 buffer"]
+        ALLOC --> WARM["3× warmup<br/>(分配 workspace / 解析 dispatch)"]
+        WARM --> CAP["with torch.npu.graph(g, pool):<br/>捕获整段 _forward_impl"]
+        CAP --> STORE["存 {graph, buf, static_out}"]
+    end
+
+    subgraph STEP["每次 forward 快路径"]
+        Z["buf.zero_() + copy_(真实输入)"] --> RP["graph.replay()"]
+        RP --> SLICE["切片 [:real] + clone() 解耦"]
+    end
+
+    STORE -. "命中同桶" .-> Z
+    CAP -. "捕获异常" .-> FAIL["_npu_graph_failed<br/>永久回退 eager"]
+```
+
+### 图 3：范式 B 生命周期（capture + 每步 task 更新 + replay）
+
+```mermaid
+flowchart TD
+    subgraph CAP["捕获期（每个 batch size Br 一次）"]
+        C1["snapshot 被涂写的 KV pool 区域<br/>(snap_k / snap_v)"] --> C2["with torch.npu.graph(g, pool):"]
+        C2 --> C3["逐层 _fia_paged_capture_layer:<br/>event.wait(stream) → graph_task_group_begin<br/>→ FIA.out(...) → graph_task_group_end"]
+        C3 --> C4["每层 task handle+event+张量<br/>存入 recorder"]
+        C4 --> C5["恢复 KV pool 快照"]
+    end
+
+    subgraph RUN["每个 AR 步 _replay_kvcache"]
+        R1["copy_ 本步输入<br/>(x / seqlen / slot_ids / block_table)"] --> R2["actual_kv = [过去长度+T for 每行]"]
+        R2 --> R3["update_stream.wait_stream(main)<br/>排序：copies 先于 re-bind"]
+        R3 --> R4["graph.replay()  (先 enqueue)"]
+        R4 --> R5["fia_paged_update(recorder, actual_kv, bt, update_stream)<br/>逐层 graph_task_update 重绑 host 参数"]
+    end
+
+    C5 -. "命中同 Br" .-> R1
+```
+
+### 图 4：范式 B 双流事件同步时序（最关键，对应 §7.1）
+
+> 图内每层 baked 的 `event.wait` 让**主流**在该层 FIA 处停下，等 **update_stream** 用本步长度重绑定并 `event.record` 放行。设备端顺序恒为 **copies → FIA 重绑定 → FIA 计算**，与 host 端两次调用先后无关。
+
+```mermaid
+sequenceDiagram
+    participant H as Host (_replay_kvcache)
+    participant M as Main Stream (replay)
+    participant U as Update Stream
+
+    H->>M: copy_ 本步输入到固定地址
+    H->>U: update_stream.wait_stream(main)  排序
+    H->>M: graph.replay()  (enqueue 全部 L 层算子)
+    H->>U: fia_paged_update(...) enqueue L 层重绑
+
+    Note over M: 第 i 层执行到 FIA 前的 event.wait(stream) → 阻塞
+    U->>U: 第 i 层 graph_task_update_begin<br/>FIA.out(actual_seq_lengths_kv=本步长度)<br/>graph_task_update_end
+    U-->>M: slot["event"].record(update_stream) 放行第 i 层
+    Note over M: 第 i 层 FIA 用最新 host 参数计算 → 继续下一层
+```
+
+**读图要点**：
+- 图 1 的分流关键只有一句话——**KV 是否每步增长**。增长（Whisper AR）就必须范式 B，其余全走范式 A。
+- 范式 A（图 2）与范式 B（图 3）的本质差异：A 是"copy 输入 → replay"两步；B 多了"每步 task 更新 FIA 的 host 启动参数"这一步（原因见 §2.5）。
+- 图 4 的双流同步是范式 B 正确性的核心：`event.wait / record` 保证无论 host 端 `replay()` 与 `fia_paged_update()` 谁先调用，设备端 FIA 一定拿到本步最新的 `actual_seq_lengths_kv`。
+
+---
+
 ## 1. 核心注意力基础设施：`diffusion/attention/backends/utils/fa.py`
 
 所有 FIA 调用与 `graph_task_group` 机制的载体。
