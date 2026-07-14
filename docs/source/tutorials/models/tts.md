@@ -180,29 +180,8 @@ NPU 上 `flash_attn_varlen_func` 绑定到 `_npu_fia_varlen_attn`（TND varlen �
 
 **去掉链条上任何一环都会破坏入图**。下面逐环拆解。
 
-### 2.2 NPU 上 `flash_attn_varlen_func` 就是 FIA —— 不是"可选算子"
 
-一个常见误解是把 `npu_fused_infer_attention_score`（FIA）当成"新增的、可以换回 `flash_attn_varlen_func` 的算子"。**在昇腾上二者是同一个东西**：
-
-```
-485  if current_omni_platform.is_npu():
-496      flash_attn_varlen_func = _npu_fia_varlen_attn   # ← 名字被绑定成 FIA 实现
-```
-
-Ascend **没有 `flash_attn` 这个 pip 包**，`flash_attn_varlen_func` 这个名字在 NPU 上就是 `_npu_fia_varlen_attn`，带 `block_table` 时进 `_npu_fia_paged_attn`，最终落到 `torch_npu.npu_fused_infer_attention_score`。调用链：
-
-```
-flash_attn_varlen_func(seqused_k=..., block_table=...)   # 上层写法
-   │  （NPU 上 == _npu_fia_varlen_attn）
-   ▼ block_table 非 None → paged 分支
-_npu_fia_paged_attn(...)                     fa.py:107
-   ▼
-torch_npu.npu_fused_infer_attention_score(...)   fa.py:216  ← 唯一落地
-```
-
-**结论**：CUDA 上才有独立的 `flash_attn` 包；NPU 上 FIA 是 `flash_attn_varlen_func` 的唯一实现本体。"换成 patch 的 `flash_attn_varlen_func`" 在 NPU 上等于没换——底层照样是 FIA。
-
-### 2.3 `actual_seq_lengths_kv`：是什么 / 为什么每步增长 / 能不能去掉
+### 2.2 `actual_seq_lengths_kv`：是什么 / 为什么每步增长 / 能不能去掉
 
 **是什么**：`(Br,)` 的 per-row 有效 K 长度 = `过去KV长度 + 当前步q长度`（`fa.py:98` 的 `seqused_k.to(int32).tolist()`，`seqused_k = cache_seqlens_before + T`）。它告诉 FIA 每个请求在静态 pool 里真实数据到哪为止：
 
@@ -225,7 +204,7 @@ slot 里的实际情况：
 
 一句话：`actual_seq_lengths_kv` 不是可有可无的附加项，而是"静态 pool 入图"这条路线的**必然产物**。
 
-### 2.4 `seqused_k` 与 `actual_seq_lengths_kv`：同一个量的两种形态
+### 2.3 `seqused_k` 与 `actual_seq_lengths_kv`：同一个量的两种形态
 
 它们是**同一个"有效长度"**，只是形态与转换时机不同，对应 patch → 入图 的演进：
 
@@ -242,7 +221,7 @@ FIA 内核**只吃 host `List[int]`**（硬性接口），所以 device→host �
 
 **所以不能"换回 `seqused_k`"**：那等于把 `.tolist()` 塞回层循环、在捕获期做 L 次 D2H —— 要么捕获直接失败，要么退回 host-bound。
 
-### 2.5 NPU Graph 录的是"地址流水账"，不是"数值流水账" —— 为什么只有 FIA 需要 task 更新
+### 2.4 NPU Graph 录的是"地址流水账"，不是"数值流水账" —— 为什么只有 FIA 需要 task 更新
 
 这是理解"为什么替换 FIA 一处、其余算子输入输出不用管"的关键。
 
@@ -269,7 +248,7 @@ FIA 内核**只吃 host `List[int]`**（硬性接口），所以 device→host �
 
 **类比**：图是一条固定流水线。传送带上的物料箱（device tensor）位置固定，换新料（`.copy_()`）跑一遍就出新品——**MLP、LN、RoPE、KV-scatter 等绝大多数算子全靠这个，零额外操作**。唯有某台机器的"配方拨盘"（FIA 的 host 参数）在建线时焊死了，换料没用，必须手动拧一下（`graph_task_update`）。
 
-### 2.6 task 组 ≠ 一张图，task 更新 ≠ 重新捕获
+### 2.5 task 组 ≠ 一张图，task 更新 ≠ 重新捕获
 
 最易混淆的一点，答案是否定的：
 
@@ -292,7 +271,7 @@ FIA 内核**只吃 host `List[int]`**（硬性接口），所以 device→host �
 
 类比：图捕获=拍电影；task 更新=放映前换张海报；replay=按录好的放映。task 更新用的是 runtime 级轻量接口 `graph_task_update_begin/end`，**只重绑参数，不重录图拓扑**。
 
-### 2.7 为什么是"每层"独立 task
+### 2.6 为什么是"每层"独立 task
 
 虽然 `block_table` / `actual_seq_lengths_kv` 对所有层相同（KV pool 全局一份、slot 映射全局一致），但**每层有独立的 graph-internal tensor**：
 
@@ -306,19 +285,6 @@ FIA 内核**只吃 host `List[int]`**（硬性接口），所以 device→host �
 
 这些 tensor 地址在捕获时分配。`graph_task_group` 按调用粒度划分——一层一个 FIA 调用 = 一个 task 组。若做成全局一个 task，就无法区分"哪些 output buffer 归哪层"，图的数据依赖会断裂。所以 `_fia_paged_capture_layer` 逐层 append 进 `recorder`，`fia_paged_update` 逐层更新。
 
-### 2.8 概念速查表
-
-| 概念 | 含义 |
-|---|---|
-| `(Br,)` | 形状标注，一维张量长度 = `Br` = 当前 AR 步**活跃请求数**（并发 talker 数），每元素对应一个请求 |
-| **slot** | KV pool 的行索引 `s ∈ [0, BC)`，一个请求占一个"车位"，多步 AR 间保持同一 slot 直到完成释放 |
-| **block_table** | "slot 编号 → block 编号"的翻译表；pool 连续，故 slot `s` 天然拥有 blocks `[s*nblk, s*nblk+nblk)`，展开为纯 arange 加法 |
-| **handle** | `graph_task_group_end` 返回的不透明句柄，runtime 用它唯一定位一个 task 组，后续 `graph_task_update_begin(stream, handle)` 凭它"遥控"该算子 |
-| **MLP** | Transformer block 的前馈子层（两层 Linear + 激活），**全静态权重、无每步变化量**，可直接 bake 进图，无需 task 更新 |
-| **workspace** | FIA kernel 的临时计算空间，捕获时按形状 `get_max_workspace` 一次分配、每次 replay 复用 |
-| **softmax_lse** | FIA 输出的 softmax log-sum-exp 中间量，每层独立 buffer |
-
----
 
 ## 3. MingDiT（flow-matching 扩散主干）—— 范式 A（最早的模板）
 
