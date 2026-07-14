@@ -453,20 +453,4 @@ if connector_extra.get("semantic_prefill_graph"): # route A（可选）
 # load 期：sem.warmup_npu_graph(k_pool, v_pool, T, batch_sizes)
 ```
 
----
-
-## 8. 全景与验证
-
-### 8.1 各模块入图一览
-
-| 模块 | 文件 | 范式 | 触发阶段 | 分桶维度 | 日志前缀 |
-|---|---|---|---|---|---|
-| MingDiT | `modeling_dit.py` | A | decode ODE 步 | batch (2^n) | `Replaying aclgraph`（vllm-ascend） |
-| MingAggregator | `modeling_dit.py` | A | **decode + prefill** | batch (2^n)，大 batch 分块 tiling | `[aggregator-npu-graph]` |
-| Conformer speaker | `conformer.py` | A | prefill | batch × mel 长 | `[conformer-npu-graph]` |
-| AudioVAE encoder | `audio_vae/encoder.py` | A | prefill | batch × frame 长 | `[audiovae-enc-npu-graph]` |
-| Whisper AR | `audio_vae/semantic.py` | **B** | decode 每步 | 精确 batch `Br` | `[semantic-npu-graph] REPLAY` |
-| Whisper route-A prefill | `audio_vae/semantic.py` | A | prefill（可选） | `(T_bucket, Br)` | `[semantic-npu-graph] PREFILL-REPLAY` |
-| Whisper EMB-prefill | `audio_vae/semantic.py` | A | prefill | `(batch, T)` | `[semantic-npu-graph] ... (EMB-PREFILL)` |
-
 
