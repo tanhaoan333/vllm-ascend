@@ -469,18 +469,4 @@ if connector_extra.get("semantic_prefill_graph"): # route A（可选）
 | Whisper route-A prefill | `audio_vae/semantic.py` | A | prefill（可选） | `(T_bucket, Br)` | `[semantic-npu-graph] PREFILL-REPLAY` |
 | Whisper EMB-prefill | `audio_vae/semantic.py` | A | prefill | `(batch, T)` | `[semantic-npu-graph] ... (EMB-PREFILL)` |
 
-### 8.2 三个反复出现的关键设计点
 
-1. **host-list cu_seqlens**：范式 A 的等长 meta 必须把 `cu_seqlens` 存成 Python list（非 tensor），否则 `_npu_fia_varlen_attn` 的 `.tolist()` D2H 同步会在捕获期报错（同一根源见 §2.4）。
-2. **懒式 + warmup 分离**：捕获都懒式（等真实 dtype/shape）；只有 Whisper AR 额外提供 load 期 `warmup_npu_graph` 把一次性成本移出 TTFP。
-3. **优雅降级**：任何捕获异常都回退 eager（Whisper AR 还区分"首捕获失败=全禁用 / 某尺寸失败=仅该尺寸 eager"）。
-
-### 8.3 验证方法
-
-- **日志**（`VLLM_LOGGING_LEVEL=INFO`）：启动/prefill 看各 `CAPTURED`；AR 步看 `REPLAY`（`info_once`，每 `Br` 桶只打一次，非未入图）。
-- **profiling**：`kernel_details.csv` 的 `Model ID` 字段——`4294967295`(=-1) 为 eager 逐 kernel，其他有效值为在图 replay；`api_statistic.csv` 看 `aclmdlRIExecuteAsync`(replay) vs `aclrtLaunchKernelWithHostArgs`(eager launch) 计数。
-- **改源码后必须重启常驻服务端**（`StageEngineCoreProc`），重跑压测客户端（`jiaoben.sh`）不会重载 server。
-
-### 8.4 尚未入图（可选后续）
-
-- AudioVAE 的 **patch aggregator**（`encoder.py::_run_aggregator`，另一个 4 层 `Qwen2PackedModel`）——最后一个未入图的 prefill 小模块，可用与 §6 相同的等长分桶方式补齐。
