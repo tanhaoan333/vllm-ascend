@@ -1,10 +1,5 @@
 # UniDiTAR NPU 图捕获（入图）实现总结
 
-> 适用代码库：`/data/tha/ttt/vllm-omni-aigc`（模块名 `uniditar`）
-> 平台：Ascend NPU（无 Inductor 后端，因此用 `torch.npu.NPUGraph` 手动捕获，而非 `torch.compile`）
-> 目标：消除逐算子 host launch（`aclrtLaunchKernelWithHostArgs`）开销，把各编码器/解码子模块用 NPU 图 `replay` 一次跑掉。
-
----
 
 ## 0. 背景与两种捕获范式
 
