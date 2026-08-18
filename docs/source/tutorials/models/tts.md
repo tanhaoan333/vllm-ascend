@@ -1,10 +1,5 @@
 # UniDiTAR 模型结构与运行架构报告
 
-> 分析对象：`vllm_omni/model_executor/models/uniditar`
->
-> 仓库：`/data/tha/0818/vllm-omni`
->
-> 说明：本文基于当前仓库静态代码分析，重点描述基础版 Ming-UniDiTAR；不包含独立的 `uniditar_tts3` 变体。文中的“支持”表示代码路径存在，不等价于已在当前机器完成模型加载、图捕获或端到端测试。
 
 ---
 
