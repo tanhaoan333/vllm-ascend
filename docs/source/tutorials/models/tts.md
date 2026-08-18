@@ -32,19 +32,6 @@ UniDiTAR 在当前 vLLM-Omni 中不是单体模型，而是一条固定的两阶
 
 ---
 
-## 2. 分析基线
-
-| 项目 | 值 |
-|---|---|
-| 仓库根目录 | `/data/tha/0818/vllm-omni` |
-| 分支 | `feature/hunyuan_tts3.0_vllm_0.20.0_rl-tq` |
-| Commit | `67b6b13538fb2c2b0e63887fcb94885c68f792fe` |
-| Commit 标题 | `refactor(uniditar): move generation parameters to model config` |
-| 目标目录状态 | 分析时 `uniditar` 目录和 `deploy/uniditar.yaml` 无未提交改动 |
-| 分析方式 | 只读静态分析，未启动服务、未加载 checkpoint、未执行测试 |
-| 平台范围 | Portable/CUDA/NPU；其他平台仅在框架层存在通用继承，不作为本文重点 |
-
----
 
 ## 3. 模型身份与注册链
 
