@@ -22,53 +22,11 @@
 | 逐 bit EXACT | 2 组 |
 | 首个可直接比较的模型数值分歧 | `speaker_raw` |
 | 首 patch latent | 非 bitwise，`abs_mean=8.32816482e-01` |
-| 任务级 benchmark | 用户已验证 NPU 与 GPU 精度基本一致 |
+| 任务级 benchmark | 已验证 NPU 与 GPU 精度基本一致 |
 
 因此：
 
 > 当前 NPU vLLM-Omni 与纯模型在算法和任务质量上是一致的，但自然运行路径尚未达到逐层 bitwise EXACT。最早的直接模型分歧位于 Speaker Encoder；AudioVAE、Semantic、Aggregator、主 LLM 和 DiT 的差异随后叠加。DiT 初始噪声在两个独立进程中不一致，是首 patch 输出差异的主要放大因素之一。
-
-### 0.2 不能将本结果解释为“模型精度差”
-
-当前 benchmark 表明 NPU 与 GPU 的生成质量几乎一致。本报告测量的是更严格的逐 bit 数值一致性，以下差异不会自动等价为质量退化：
-
-- 不同 NPU kernel 的 reduction/cast 顺序；
-- vLLM Paged KV 与纯模型 DynamicCache；
-- vLLM 的 bucket padding；
-- 两侧 AudioVAE posterior 的随机调用次数；
-- 两个进程中不同的 NPU RNG 消费历史；
-- FIA 与纯模型 attention 路径差异。
-
----
-
-## 1. 实测环境
-
-| 项目 | 值 |
-|---|---|
-| Docker 容器 | `tanhaoan` |
-| Conda 环境 | `hhh` |
-| 物理设备 | NPU7 |
-| NPU 型号 | Ascend950PR |
-| 容器内逻辑设备 | `npu:0` |
-| PyTorch | `2.9.0+cpu`，Ascend 定制构建 |
-| torch-npu | `2.9.0.post4` |
-| Transformers | `4.57.6` |
-| vLLM | `0.20.1.dev336+g0f24991c7` |
-| vLLM-Omni commit | `f411c7ff5e568feb164e28126d4498b663304e38` |
-| 纯模型 commit | `c6a49adf16f6fd6eb2d18ef9a1c869f602f2b74a` |
-| dtype | BF16；waveform、部分归一化及 solver 为 FP32 |
-| batch | 1 |
-| async scheduling | 关闭 |
-| streaming | 关闭，`async_chunk=false` |
-| ACLGraph/NPUGraph | 关闭，`enforce_eager=true`、`cudagraph_mode=NONE` |
-| UniDiTAR 后加载融合 | 关闭，`VLLM_OMNI_ENABLE_UNIDITAR_NPU_FUSIONS=0` |
-| prefix caching | 关闭 |
-| seed | 42 |
-| ODE steps | 10 |
-| CFG alpha | 2.0 |
-| fm_scale | 0.999 |
-| sample strategy | `base` |
-
 
 
 ---
@@ -128,17 +86,7 @@ relative_mean = 0
 
 ### 3.1 纯模型
 
-纯模型实际运行于物理 NPU7：
-
-```bash
-ASCEND_RT_VISIBLE_DEVICES=7 \
-python tools/uniditar_precision_hf_npu.py \
-  --output /data/tha/bitwise_runs/0817_npu7_20260820_1245 \
-  --model /data/tha/models \
-  --seed 42
-```
-
-纯模型 `/data/tha/UniDiTAR` 的 Speaker mel 默认使用 `torch.stft`，当前 Ascend950PR runtime 明确报：
+纯模型的 Speaker mel 默认使用 `torch.stft`，当前 Ascend950PR runtime 明确报：
 
 ```text
 STFT is not supported on this platform
@@ -150,35 +98,12 @@ STFT is not supported on this platform
 gather framing + cos/sin DFT basis + matmul
 ```
 
-没有修改 `/data/tha/UniDiTAR` 生产代码和权重。该处理也使 Speaker 输入特征路径更适合直接比较。
 
 ### 3.2 vLLM-Omni
 
-使用独立验证 YAML，未覆盖生产配置：
-
-```bash
-ASCEND_RT_VISIBLE_DEVICES=7 \
-VLLM_OMNI_ENABLE_UNIDITAR_NPU_FUSIONS=0 \
-UNIDITAR_PRECISION_DUMP_DIR=/data/tha/bitwise_runs/0817_npu7_20260820_1245 \
-vllm-omni serve /data/tha/models \
-  --omni \
-  --served-model-name UniDiTAR \
-  --deploy-config /data/tha/0817/vllm-omni/tools/uniditar_npu_bitwise_eager_b1.yaml \
-  --trust-remote-code \
-  --disable-log-stats \
-  --host 0.0.0.0 \
-  --port 8021
-```
 
 固定请求：
 
-```bash
-python tools/send_uniditar_precision_request.py \
-  --port 8021 \
-  --output /data/tha/bitwise_runs/0817_npu7_20260820_1245/10002287-00000095_vllm.wav
-```
-
-请求返回 HTTP 200。首 patch 解码输出：
 
 | 项目 | 值 |
 |---|---:|
@@ -189,9 +114,6 @@ python tools/send_uniditar_precision_request.py \
 | 时长 | 0.2 s |
 | sample width | 2 bytes |
 
-输出文件：
-
-- `/data/tha/bitwise_runs/0817_npu7_20260820_1245/10002287-00000095_vllm.wav`
 
 ---
 
@@ -255,10 +177,6 @@ E_{rel}=\frac{E_{abs}}{\operatorname{mean}(|x_{pure}|)+10^{-30}}
 | DiT solved | `[1,1,10,64]` | FP32 | False | `8.33342075e-01` | `3.15600204e+00` | `1.08113224e+00` |
 | First new patch | `[10,64]` | FP32 | False | `8.32816482e-01` | `3.15549254e+00` | `1.08153207e+00` |
 
-完整 158 项逐层结果：
-
-- `/data/tha/bitwise_runs/0817_npu7_20260820_1245/comparison.md`
-- `/data/tha/bitwise_runs/0817_npu7_20260820_1245/comparison.json`
 
 ---
 
