@@ -1,873 +1,570 @@
-# UniDiTAR 模型结构与模型行为报告
+# UniDiTAR NPU Bitwise 一致性实测报告
+
+本文档记录对以下两套实现进行的真实 BF16、batch=1、prefill 首步、关闭 Graph、关闭 UniDiTAR 后加载融合的数值对比：
+
+
+- **测试样本**：`/data/tha/seedtts_testset1/zh/meta.lst` 第一条
 
 
 ---
 
-## 1. 结论摘要
+## 0. 结论
 
-UniDiTAR 在当前 vLLM-Omni 中不是单体模型，而是一条固定的两阶段 TTS Pipeline：
+### 0.1 总结
 
-1. **Stage 0：`UniDiTARTalker`**
-   - 使用 Qwen2 做自回归条件建模；
-   - 使用 AudioVAE Encoder + Whisper Semantic Encoder 提取参考音频语义；
-   - 使用 MingAggregator 将一组 semantic frame 聚合成一个 LLM soft token；
-   - 使用 `stop_head` 判断是否停止；
-   - 使用 MingDiT + Euler/可选 SDE flow-matching，每个 AR tick 生成一个声学 latent patch。
+本次自然端到端首 patch 对比结果为：
 
-2. **Stage 1：`UniDiTARCode2Wav`**
-   - 接收 Stage 0 产生的 fp32 latent；
-   - 使用 AudioVAE Decoder 将 latent 解码为波形；
-   - 支持整句解码和带 paged KV、lookahead、ISTFT overlap-add 状态的流式解码；
-   - 最终输出 24 kHz 音频。
-
-两个 Stage 都注册为 `UniDiTARForConditionalGeneration`，但各自位于独立 Stage Engine 中，通过 `model_stage` 只构建当前 Stage 所需的子模型。
-
-模型运行中存在三套不同所有权的 KV Cache：
-
-- Stage 0 Qwen2 的 vLLM KV Cache；
-- Stage 0 Whisper semantic 的模型自有 `SemanticKVPool`；
-- Stage 1 AudioVAE Decoder 的模型自有 `VAEDecoderKVPool`。
-
-图执行也不是把整个模型一次性捕获：外层请求编排、状态管理、随机数生成和流式拼接保持 eager，内部固定 shape 的 Qwen2、Semantic、Aggregator、DiT、Speaker Encoder、VAE 子模块按 bucket 捕获和重放。
-
----
-
-
-## 3. 模型身份与注册链
-
-### 3.1 模型身份
-
-| 项目 | 当前实现 |
+| 项目 | 实测结论 |
 |---|---|
-| 模型名称 | Ming-UniDiTAR / UniDiTAR |
-| HF `model_type` | `ming_uni_ditar` |
-| Pipeline key | `uniditar` |
-| HF architecture 别名 | `MingUniDiTAR`、`UniDiTARForConditionalGeneration` |
-| vLLM-Omni architecture | `UniDiTARForConditionalGeneration` |
-| 顶层入口 | `uniditar/uniditar.py::UniDiTARForConditionalGeneration` |
-| Pipeline 定义 | `uniditar/pipeline.py::UNIDITAR_PIPELINE` |
-| 模型类型 | 两阶段 AR + Generation TTS Pipeline |
+| 输入 waveform | **EXACT** |
+| acoustic frame 数 | **EXACT**，两端均为 240 |
+| 自动匹配 tensor | 158 组 |
+| 逐 bit EXACT | 2 组 |
+| 首个可直接比较的模型数值分歧 | `speaker_raw` |
+| 首 patch latent | 非 bitwise，`abs_mean=8.32816482e-01` |
+| 任务级 benchmark | 用户已验证 NPU 与 GPU 精度基本一致 |
 
-### 3.2 注册与加载链
+因此：
 
-```mermaid
-flowchart TD
-    A[HF checkpoint config] --> B[MingUniDiTARConfig]
-    B --> C{Pipeline 识别}
-    C -->|显式 pipeline: uniditar| D[PipelineRegistry]
-    C -->|architecture fallback| D
-    D --> E[UNIDITAR_PIPELINE]
-    E --> F0[Stage 0 model_stage=uniditar_talker]
-    E --> F1[Stage 1 model_stage=uniditar_code2wav]
-    F0 --> G[Model Registry]
-    F1 --> G
-    G --> H[UniDiTARForConditionalGeneration]
-    H -->|stage 0| I[UniDiTARTalker]
-    H -->|stage 1| J[UniDiTARCode2Wav]
-```
+> 当前 NPU vLLM-Omni 与纯模型在算法和任务质量上是一致的，但自然运行路径尚未达到逐层 bitwise EXACT。最早的直接模型分歧位于 Speaker Encoder；AudioVAE、Semantic、Aggregator、主 LLM 和 DiT 的差异随后叠加。DiT 初始噪声在两个独立进程中不一致，是首 patch 输出差异的主要放大因素之一。
 
-实际闭环如下：
+### 0.2 不能将本结果解释为“模型精度差”
 
-1. `MingUniDiTARConfig` 注册 `model_type="ming_uni_ditar"`，并将远端 checkpoint config 归一化到本地配置类。
-2. `pipeline_registry.py` 将 Pipeline key `uniditar` 映射到 `UNIDITAR_PIPELINE`。
-3. `StageConfigFactory` 优先使用 deploy YAML 中的 `pipeline: uniditar`；没有显式指定时，可通过 HF architecture 命中。
-4. `registry.py` 将 architecture `UniDiTARForConditionalGeneration` 映射到 `uniditar.uniditar`。
-5. 顶层 wrapper 读取 `vllm_config.model_config.model_stage`，选择构建 Talker 或 Code2Wav。
-6. 多模态装饰器将 UniDiTAR processor、processing info 和 dummy input builder 注册到 vLLM `MULTIMODAL_REGISTRY`。
+当前 benchmark 表明 NPU 与 GPU 的生成质量几乎一致。本报告测量的是更严格的逐 bit 数值一致性，以下差异不会自动等价为质量退化：
 
-关键证据：
-
-- `vllm_omni/transformers_utils/configs/uniditar.py`
-- `vllm_omni/config/pipeline_registry.py`
-- `vllm_omni/config/stage_config.py::_resolve_scheduler`
-- `vllm_omni/model_executor/models/registry.py`
-- `vllm_omni/model_executor/models/uniditar/pipeline.py:29-62`
-- `vllm_omni/model_executor/models/uniditar/uniditar.py:23-56`
+- 不同 NPU kernel 的 reduction/cast 顺序；
+- vLLM Paged KV 与纯模型 DynamicCache；
+- vLLM 的 bucket padding；
+- 两侧 AudioVAE posterior 的随机调用次数；
+- 两个进程中不同的 NPU RNG 消费历史；
+- FIA 与纯模型 attention 路径差异。
 
 ---
 
-## 4. Pipeline 总体运行架构
+## 1. 实测环境
 
-### 4.1 端到端结构图
-
-```mermaid
-flowchart LR
-    U[用户请求<br/>文本 + 参考音频 + 可选时长/控制信息]
-    P[UniDiTAR MM Processor<br/>Prompt + Placeholder + mm_kwargs]
-
-    subgraph S0[Stage 0: UniDiTARTalker / LLM_AR]
-        SPK[Conformer Speaker Encoder]
-        VE[AudioVAE Encoder]
-        SEM[Whisper Semantic Encoder]
-        AGG[MingAggregator]
-        LLM[Qwen2 AR Backbone]
-        STOP[2-class Stop Head]
-        DIT[MingDiT<br/>Euler / optional SDE]
-        STATE[Request State<br/>History + Semantic KV]
-    end
-
-    CONN[SharedMemoryConnector<br/>fp32 latent chunk + metadata]
-
-    subgraph S1[Stage 1: UniDiTARCode2Wav / LLM_GENERATION]
-        NORM[Latent Denormalize]
-        VD[AudioVAE Qwen2 Decoder]
-        ISTFT[ISTFT + Overlap-Add]
-        STREAM[Stream State + Decoder KV]
-    end
-
-    OUT[24 kHz waveform delta / final audio]
-
-    U --> P
-    P --> SPK
-    P --> VE
-    VE --> SEM
-    SEM --> AGG
-    SPK --> LLM
-    AGG --> LLM
-    LLM --> STOP
-    STOP -->|continue| DIT
-    STATE <--> SEM
-    STATE <--> DIT
-    DIT -->|每 tick 一个 latent patch| CONN
-    CONN --> NORM
-    NORM --> VD
-    STREAM <--> VD
-    VD --> ISTFT
-    ISTFT --> OUT
-    STOP -->|EOS / max length| CONN
-```
-
-### 4.2 Stage 表
-
-| Stage | `execution_type` | `model_stage` | 核心实现 | 输入 | 输出 | Scheduler |
-|---|---|---|---|---|---|---|
-| 0 | `LLM_AR` | `uniditar_talker` | `UniDiTARTalker` | 文本 token、参考音频、speaker/duration 条件、历史 latent | 每 tick 一个 `[patch_size, z_dim]` fp32 latent slab；结束时附 stop reason/可选 trajectory | 默认 `OmniARAsyncScheduler`；关闭异步调度时为 `OmniARScheduler` |
-| 1 | `LLM_GENERATION` | `uniditar_code2wav` | `UniDiTARCode2Wav` | Connector 携带的 `[Tchunk, z_dim]` fp32 latent；token id 仅为长度占位 | 当前 chunk 的 fp32 waveform 和 sample rate | `OmniGenerationScheduler` |
-
-CUDA 侧 Runner：
-
-- Stage 0：`GPUARModelRunner`
-- Stage 1：`GPUGenerationModelRunner`
-
-NPU 侧 Runner：
-
-- Stage 0：`NPUARModelRunner`
-- Stage 1：`NPUGenerationModelRunner`
-
-两类 Runner 都复用 Omni Runner 的输入准备、Connector、输出组装和自定义 Graph capture 生命周期；不能因为基类或文件名含 `GPU` 就把框架通用逻辑理解为仅支持 CUDA。
-
----
-
-## 5. 模型内部模块结构
-
-### 5.1 类与模块关系
-
-```mermaid
-classDiagram
-    class UniDiTARForConditionalGeneration {
-        +model_stage
-        +forward()
-        +compute_logits()
-        +embed_multimodal()
-        +load_weights()
-    }
-
-    class UniDiTARTalker {
-        +Qwen2Model model
-        +MingAggregator aggregator
-        +MingDiT dit
-        +Linear stop_head
-        +ConformerSpeakerEncoder speaker_encoder
-        +AudioVAE wavegan
-        +SemanticKVPool
-    }
-
-    class UniDiTARCode2Wav {
-        +AudioVAE wavegan
-        +VAEDecoderKVPool
-        +StreamState state_by_req
-        +forward()
-    }
-
-    class AudioVAE {
-        +Encoder encoder
-        +WhisperAudioEncoder semantic_module
-        +Decoder decoder
-    }
-
-    class MingAggregator
-    class MingDiT
-    class Qwen2Model
-    class Qwen2PackedModel
-    class ConformerSpeakerEncoder
-    class ISTFTHead
-
-    UniDiTARForConditionalGeneration --> UniDiTARTalker : model_stage=talker
-    UniDiTARForConditionalGeneration --> UniDiTARCode2Wav : model_stage=code2wav
-    UniDiTARTalker --> Qwen2Model
-    UniDiTARTalker --> MingAggregator
-    UniDiTARTalker --> MingDiT
-    UniDiTARTalker --> ConformerSpeakerEncoder
-    UniDiTARTalker --> AudioVAE
-    UniDiTARCode2Wav --> AudioVAE
-    AudioVAE --> Qwen2PackedModel
-    AudioVAE --> ISTFTHead
-```
-
-### 5.2 默认模型参数
-
-下表来自本地 `MingUniDiTARConfig` 默认值；真实部署以 checkpoint config 和 `hf_overrides` 为准。
-
-| 子模块/参数 | 默认值或结构 |
+| 项目 | 值 |
 |---|---|
-| 主 AR LLM | Qwen2，28 层，hidden size 1536，12 个 Q head，2 个 KV head |
-| MingAggregator | 8 层，hidden size 1024，16 heads |
-| MingDiT | 8 层，hidden size 1024，16 heads |
-| 声学 latent 维度 | `z_dim=64` |
-| Talker patch | `patch_size=4` 个 latent frame/AR token |
-| DiT history | `pre_patch_size=32` 个 latent frame |
-| 输出采样率 | 24 kHz |
-| 默认 ODE 步数 | `s_steps=10` |
-| 默认 CFG | `cfg_alpha=2.0` |
-| 默认 flow scale | `fm_scale=0.999` |
-| 默认最大生成 patch 数 | 600 |
+| Docker 容器 | `tanhaoan` |
+| Conda 环境 | `hhh` |
+| 物理设备 | NPU7 |
+| NPU 型号 | Ascend950PR |
+| 容器内逻辑设备 | `npu:0` |
+| PyTorch | `2.9.0+cpu`，Ascend 定制构建 |
+| torch-npu | `2.9.0.post4` |
+| Transformers | `4.57.6` |
+| vLLM | `0.20.1.dev336+g0f24991c7` |
+| vLLM-Omni commit | `f411c7ff5e568feb164e28126d4498b663304e38` |
+| 纯模型 commit | `c6a49adf16f6fd6eb2d18ef9a1c869f602f2b74a` |
+| dtype | BF16；waveform、部分归一化及 solver 为 FP32 |
+| batch | 1 |
+| async scheduling | 关闭 |
+| streaming | 关闭，`async_chunk=false` |
+| ACLGraph/NPUGraph | 关闭，`enforce_eager=true`、`cudagraph_mode=NONE` |
+| UniDiTAR 后加载融合 | 关闭，`VLLM_OMNI_ENABLE_UNIDITAR_NPU_FUSIONS=0` |
+| prefix caching | 关闭 |
+| seed | 42 |
+| ODE steps | 10 |
+| CFG alpha | 2.0 |
+| fm_scale | 0.999 |
+| sample strategy | `base` |
 
-配置校验会强制以下维度闭环：
 
-- `model_dim == Qwen2.hidden_size`；
-- Aggregator 输出维度等于 `model_dim`；
-- DiT condition dim 等于 `model_dim`；
-- DiT input channels 和 AudioVAE latent dim 等于 `z_dim`。
-
-证据：`vllm_omni/model_executor/models/uniditar/validation.py`。
-
----
-
-## 6. 输入与多模态 Processor
-
-### 6.1 请求输入
-
-Processor 以文本为主输入，并支持以下音频派生条件：
-
-- `audio`：ICL 参考音频或非 ICL prompt audio；
-- `spkr_emb`：从同一参考音频提取 speaker embedding；
-- `dur`：由用户给定 duration 映射成 duration embedding index。
-
-常见控制字段包括：
-
-- `task_type`
-- `prompt_text`
-- `instruct_text`
-- `ambient_sound_caption`
-- `context_text`
-- `language`
-- `use_icl_mode`
-- `is_first_round`
-- `duration`
-- `use_zero_spk_emb`
-
-裸一维 waveform 不被接受；调用方应提供 `(wav, sample_rate)` 或文件路径。Processor 将音频重采样到 24 kHz、转成单通道并按 VAE hop 和 Talker patch 对齐补零。
-
-### 6.2 Placeholder 机制
-
-Processor 将音频派生成三个逻辑 modality，保证它们都进入 vLLM multimodal 路径：
-
-| Modality | Prompt token | 行为 |
-|---|---|---|
-| `spkr_emb` | `<|spkr_embed|>` | 1 个 token 替换为 1 个 speaker embedding |
-| `dur` | `<|dur_embed|>` | 1 个 token 替换为 1 个 duration embedding |
-| `audio`，ICL 模式 | `<|spkr_latent|>` | 展开为 N 个 AudioVAE latent/Aggregator soft-token slot |
-| `audio`，非 ICL 模式 | `<|audio_start|>` | 保持 1→1，占位不扩展，但将原始音频送入 preprocess |
-
-### 6.3 输入数据流
-
-```text
-文本 + 参考音频
-  -> UniDiTARMultiModalDataParser
-  -> UniDiTARMultiModalProcessor
-  -> prompt_token_ids + mm_kwargs
-  -> Talker.embed_multimodal()
-       ├─ AudioVAE Encoder -> prompt acoustic latent
-       ├─ Speaker Encoder -> speaker embedding
-       └─ duration index -> duration embedding
-  -> embed_input_ids / inputs_embeds
-  -> Qwen2 forward
-```
-
-关键证据：
-
-- `uniditar_mm_processor.py:62-123`：音频解析和三个 modality；
-- `uniditar_mm_processor.py:187-300`：Prompt 与多模态 feature；
-- `uniditar_mm_processor.py:343-444`：Placeholder 替换；
-- `uniditar_mm_processor.py:473-478`：多模态注册。
 
 ---
 
-## 7. Stage 0：UniDiTARTalker
+## 2. 测试输入
 
-### 7.1 核心组件
+### 2.1 SeedTTS 样本
 
-| 模块 | 作用 | 主要输入 | 主要输出 |
-|---|---|---|---|
-| Qwen2 主模型 | 对文本、speaker、duration、semantic soft token 做因果建模 | packed token/embedding `[N, Dmodel]` | hidden state `[N, Dmodel]` |
-| AudioVAE Encoder | 将 prompt waveform 编码为声学 latent | `[B, Twav]` fp32 | `[B, Tz, z_dim]` |
-| Whisper Semantic Encoder | 从 latent 提取语义特征 | packed latent `[total_q, z_dim]` | `[total_q, Csem]` |
-| MingAggregator | 每 `patch_size` 个 semantic frame 聚合为一个 LLM token | `[B, T, Csem]` | `[B, P, Dmodel]` |
-| Speaker Encoder | 从参考音频提取说话人条件 | waveform/log-mel | `[B, Dmodel]` |
-| `stop_head` | 二分类停止判定 | 当前 AR hidden | continue/EOS |
-| MingDiT | 根据 LLM condition 和历史 latent 生成下一 patch | noise、condition、history、time | `[B, patch_size, z_dim]` |
+| 字段 | 值 |
+|---|---|
+| fid | `10002287-00000095` |
+| language | `zh` / API 使用 `Chinese` |
+| prompt text | `在此奉劝大家别乱打美白针。` |
+| prompt wav | `/data/tha/seedtts_testset1/zh/prompt-wavs/10002287-00000094.wav` |
+| infer text | `简单地说，这相当于惠普把消费领域市场拱手相让了。` |
+| use ICL | `true` |
 
-### 7.2 AudioVAE Encoder
+### 2.2 Waveform 输入数值
 
-Prompt waveform 的编码链：
-
-```text
-waveform [B, Twav]
-  -> 按 input_dim/hop_size 切帧
-  -> Linear projection
-  -> causal Qwen2Packed Encoder
-  -> 可选 patch aggregation / CLS
-  -> Linear 到 2 * z_dim
-  -> Diagonal Gaussian posterior.sample()
-  -> acoustic latent [B, Tz, z_dim]
-```
-
-注意：prompt 编码会从 posterior 采样，不是纯确定性均值编码；随后 Talker 使用 fp32 global mean/std 做 latent 归一化。
-
-### 7.3 Semantic + Aggregator
-
-Semantic 链：
+两侧 waveform 均为：
 
 ```text
-latent [total_q, z_dim]
-  -> decoder.fc1
-  -> GELU
-  -> decoder.fc2
-  -> WhisperAudioEncoder
-  -> semantic [total_q, Csem]
-  -> semantic normalize
-  -> 按 patch_size 分组
-  -> MingAggregator
-  -> LLM soft token [Npatch, Dmodel]
+shape = [1, 115200]
+dtype = torch.float32
 ```
 
-MingAggregator 的内部结构：
+前 8 个值：
+
+| 纯模型 | vLLM-Omni |
+|---|---|
+| `[-0.00518798828125, -0.004425048828125, -0.00390625, -0.005950927734375, -0.004547119140625, -0.005126953125, -0.00445556640625, -0.004119873046875]` | `[-0.00518798828125, -0.004425048828125, -0.00390625, -0.005950927734375, -0.004547119140625, -0.005126953125, -0.00445556640625, -0.004119873046875]` |
+
+指标：
 
 ```text
-[B, T, Csem]
-  -> reshape [B*P, patch_size, Csem]
-  -> Linear(Csem, H)
-  -> 拼接可学习 CLS
-  -> 双向 Transformer blocks + RoPE
-  -> 取 CLS
-  -> [B, P, Dmodel]
+exact         = True
+abs_mean      = 0
+abs_max       = 0
+relative_mean = 0
 ```
 
-Aggregator attention 是非 causal 的，因为它只在一个固定长度的 acoustic patch 内聚合局部 semantic frame。
+### 2.3 Token 对齐口径
 
-### 7.4 Talker AR 闭环
+纯模型 dump 的 `prompt_token_ids` 为 prefix 部分 `[1, 41]`；vLLM dump 位于 runner preprocess 后，为完整 packed prompt `[94]`，且 dtype 分别为 INT64/INT32。
 
-```mermaid
-sequenceDiagram
-    participant R as AR Runner
-    participant T as Talker
-    participant S as Semantic + Aggregator
-    participant L as Qwen2
-    participant H as Stop Head
-    participant D as MingDiT
-    participant C as Connector
+将 vLLM 前 41 个 token 与纯模型 prefix 对齐后，数值差为 0；但因为：
 
-    R->>T: 当前 token/embedding + request state
-    T->>S: prompt latent 或上一 tick latent
-    S-->>T: 一个或多个 semantic soft token
-    T->>L: packed inputs_embeds + positions + vLLM KV
-    L-->>T: hidden states
-    R->>T: make_omni_output / 采样位置
-    T->>H: 当前请求 hidden
-    alt stop 或达到长度上限
-        H-->>T: EOS
-        T-->>R: synthetic EOS token id=2
-        R->>C: final flush / EOF
-    else continue
-        T->>D: condition + history + noise
-        D-->>T: 下一 latent patch
-        T-->>R: latent + synthetic continue id=1
-        R->>C: fp32 latent slab
-    end
+- scope 不同：prefix-only vs full prompt；
+- shape 不同：41 vs 94；
+- dtype 不同：INT64 vs INT32；
+
+所以该节点不计为模型数值首分歧。第一个可直接比较的模型输出是 `speaker_raw`。
+
+---
+
+## 3. 实际运行方式
+
+### 3.1 纯模型
+
+纯模型实际运行于物理 NPU7：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=7 \
+python tools/uniditar_precision_hf_npu.py \
+  --output /data/tha/bitwise_runs/0817_npu7_20260820_1245 \
+  --model /data/tha/models \
+  --seed 42
 ```
 
-每个 tick 的关键顺序：
-
-1. 将 prompt latent 或上一 tick 的 latent 送入 semantic encoder；
-2. Aggregator 将 semantic patch 压缩成 Qwen2 soft token；
-3. Qwen2 使用 vLLM paged KV 做 AR forward；
-4. 从采样位置取 hidden state；
-5. `stop_head` 判断是否终止；
-6. 未终止时，MingDiT 生成下一 acoustic latent patch；
-7. 新 latent 一方面发送给 Stage 1，另一方面保存为下一 tick 的 semantic 输入和 DiT history；
-8. `compute_logits()` 不预测文本词表内容，而是只把 token 1 或 2 的 logit 设为极大值，让标准 vLLM sampler 驱动继续/停止。
-
-合成 token：
-
-- `SAFE_TOKEN_ID=1`：继续；
-- `EOS_TOKEN_ID=2`：结束；
-- Pipeline sampling constraint：`stop_token_ids=[2]`。
-
-### 7.5 MingDiT 与 flow-matching
-
-MingDiT 单次网络输入大致为：
-
-| 张量 | Shape | 说明 |
-|---|---|---|
-| 当前状态 `x` | `[2B, patch_size, z_dim]` | CFG 将 unconditional/conditional 在 batch 维拼接 |
-| 时间 `t` | `[2B]` | flow time |
-| condition | `[2B, 1, Dmodel]` | Qwen2 当前 hidden |
-| history | `[2B, pre_patch_size, z_dim]` | 当前轮生成历史窗口 |
-
-DiT Transformer 序列由以下部分组成：
+纯模型 `/data/tha/UniDiTAR` 的 Speaker mel 默认使用 `torch.stft`，当前 Ascend950PR runtime 明确报：
 
 ```text
-[timestep embedding + LLM condition]
-  + [history latent]
-  + [current noisy latent]
+STFT is not supported on this platform
 ```
 
-网络预测速度场，solver 只取最后 `patch_size` 个位置。默认 Euler 更新为：
+为使纯模型能在 NPU 上执行，本次测试脚本仅在验证进程内将纯模型 mel 函数替换为 vLLM-Omni NPU 已验证的数学等价显式 DFT：
+
+```text
+gather framing + cos/sin DFT basis + matmul
+```
+
+没有修改 `/data/tha/UniDiTAR` 生产代码和权重。该处理也使 Speaker 输入特征路径更适合直接比较。
+
+### 3.2 vLLM-Omni
+
+使用独立验证 YAML，未覆盖生产配置：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=7 \
+VLLM_OMNI_ENABLE_UNIDITAR_NPU_FUSIONS=0 \
+UNIDITAR_PRECISION_DUMP_DIR=/data/tha/bitwise_runs/0817_npu7_20260820_1245 \
+vllm-omni serve /data/tha/models \
+  --omni \
+  --served-model-name UniDiTAR \
+  --deploy-config /data/tha/0817/vllm-omni/tools/uniditar_npu_bitwise_eager_b1.yaml \
+  --trust-remote-code \
+  --disable-log-stats \
+  --host 0.0.0.0 \
+  --port 8021
+```
+
+固定请求：
+
+```bash
+python tools/send_uniditar_precision_request.py \
+  --port 8021 \
+  --output /data/tha/bitwise_runs/0817_npu7_20260820_1245/10002287-00000095_vllm.wav
+```
+
+请求返回 HTTP 200。首 patch 解码输出：
+
+| 项目 | 值 |
+|---|---:|
+| 文件字节数 | 9644 |
+| 声道 | 1 |
+| 采样率 | 24000 Hz |
+| 样本数 | 4800 |
+| 时长 | 0.2 s |
+| sample width | 2 bytes |
+
+输出文件：
+
+- `/data/tha/bitwise_runs/0817_npu7_20260820_1245/10002287-00000095_vllm.wav`
+
+---
+
+## 4. 误差定义与 shape 对齐
+
+对 shape 可比较的 tensor：
 
 \[
-z_{i+1}=z_i+v(z_i,t_i,condition,history)\cdot(t_{i+1}-t_i)
+E_{abs}=\operatorname{mean}(|x_{vllm}-x_{pure}|)
 \]
-
-CFG 合成为：
 
 \[
-v=v_{cond}+(v_{cond}-v_{uncond})\cdot\alpha
+E_{max}=\max(|x_{vllm}-x_{pure}|)
 \]
 
-最终 latent 乘 `fm_scale`。默认运行 10 个 solver step；可选 SDE 只在配置的连续 step 区间注入噪声。随机数在 Graph 外生成并拷入静态输入，避免 Graph replay 重复同一噪声。
+\[
+E_{rel}=\frac{E_{abs}}{\operatorname{mean}(|x_{pure}|)+10^{-30}}
+\]
 
-### 7.6 Talker 请求状态
+`exact=True` 要求：
 
-Talker 为每个请求维护 `_RequestState`，主要包含：
+- shape 相同；
+- dtype 相同；
+- `torch.equal()` 为真。
 
-- 所有已进入 semantic cache 的 latent archive；
-- 当前轮 prompt、轮次起始位置；
-- 上一个 latent patch；
-- DiT history；
-- 当前帧数、EOS、stop reason；
-- SemanticKVPool slot；
-- 可选 SDE trajectory。
+### Bucket 对齐
 
-多轮请求会保留 semantic KV 和 latent archive，只重置轮内状态。vLLM 抢占请求时，模型自有 semantic pool 会 rewind；恢复时通过 archive replay 重建 semantic KV，从而与 vLLM 的 recompute 语义对齐。
+即使关闭 Graph，当前 UniDiTAR 的 GraphSlot eager path 仍使用静态 bucket buffer。因此：
 
----
+- Semantic：纯模型真实长度 240，vLLM bucket 256；比较前取 vLLM 前 240 行；
+- Aggregator：纯模型真实 patch batch 24，vLLM bucket 32；比较前取 vLLM 前 24 行；
+- 主 LLM：纯模型 `[1,T,D]` 与 vLLM packed `[T,D]`，仅去除纯模型 batch=1 维；
+- 首 patch：纯模型 `[1,10,64]` 与 vLLM `[10,64]`，仅去除 batch=1 维。
 
-## 8. Stage 间 Connector 与数据契约
-
-### 8.1 Streaming 路径
-
-`talker2code2wav_async_chunk()` 将每个 Talker step 的二维 latent slab 缓存在请求级 buffer 中。当累计到 `code2wav_chunk_M` 个完整 patch 时发送 Stage 1；请求结束时 flush 剩余 patch，若没有剩余数据则发送纯 EOF。
-
-代码默认 `DEFAULT_CHUNK_PATCHES=25`，但当前 `deploy/uniditar.yaml` 显式设置 `code2wav_chunk_M: 1`，因此当前部署配置的实际意图是**每生成一个 Talker patch 就向 Code2Wav flush 一次**。
-
-主要 payload：
-
-| Key | 含义 |
-|---|---|
-| `latent` | fp32 `[M * patch_size, z_dim]`，EOF 时可为空 |
-| `codes.audio` | Stage 1 token 长度占位 `[0]` |
-| `req_id` | 请求 ID |
-| `stream_finished` / `meta.finished` | 是否最后一个 chunk |
-| `chunk_id` | chunk 序号 |
-| `emit_patch_count` | 本次发出的 patch 数 |
-| `latent_shape` | 可观测性 shape |
-| `estimated_bytes` | payload 估算字节数 |
-| `final_flush` | 是否结束 flush |
-| `stop_reason` | continue、stop head 或最大长度停止 |
-| `trajectory` | 可选 SDE 轨迹，仅 final flush 携带 |
-
-Stage 1 的 token id 只是调度占位。真正的 fp32 latent 通过 `SharedMemoryConnector` 的 additional/intermediate information 到达模型。
-
-### 8.2 非流式路径
-
-`talker2code2wav_full_payload()` 在 Talker 完成后发送完整 utterance latent：
-
-- latent 被转为连续 fp32；
-- 最大 latent frame 在同步适配路径中受 `MAX_LATENT_FRAMES=4096` 限制；
-- Stage 1 识别为首次到达且同时 `is_last` 时，直接执行 `wavegan.decode()`，不创建 streaming KV slot。
-
-关键证据：`vllm_omni/model_executor/stage_input_processors/uniditar.py:106-310`。
+不会 reshape、重排或截断 feature 维。
 
 ---
 
-## 9. Stage 1：UniDiTARCode2Wav
+## 5. 模块端到端实测汇总
 
-### 9.1 解码结构
+| 模块/节点 | shape（对齐后） | dtype | exact | abs_mean | abs_max | relative_mean |
+|---|---|---|---:|---:|---:|---:|
+| Prompt waveform | `[1,115200]` | FP32 | **True** | `0` | `0` | `0` |
+| Speaker raw | `[1,256]` | FP32 | False | `8.22384260e-04` | `2.51865387e-03` | `1.57660755e-03` |
+| Speaker projected | `[1,1536]` | BF16 | False | `3.74971278e-04` | `1.95312500e-03` | `4.40523853e-03` |
+| VAE encoder output | `[1,240,128]` | BF16 | False | `2.12574732e-02` | `4.37500000e-01` | `3.64127862e-03` |
+| Acoustic frame num | `[1]` | INT32 | **True** | `0` | `0` | `0` |
+| Acoustic latent raw | `[1,240,64]` | BF16 | False | `3.07773259e-02` | `4.37500000e-01` | `5.49650013e-03` |
+| Acoustic latent normalized | `[1,240,64]` | FP32 | False | `5.16233547e-03` | `6.85229301e-02` | `6.70999612e-03` |
+| Semantic layer 0 | `[240,1280]` | BF16 | False | `1.05030859e+00` | `4.30000000e+01` | `1.76866763e-01` |
+| Semantic final | `[240,1280]` | BF16 | False | `1.06241441e+00` | `1.02656250e+01` | `8.76346550e-01` |
+| Aggregator layer 0 | `[24,11,1024]` | BF16 | False | `1.93286344e-01` | `1.21875000e+00` | `8.30295467e-01` |
+| Aggregator final | `[24,1,1536]` | BF16 | False | `2.95603216e-01` | `1.93750000e+00` | `8.70069771e-01` |
+| LLM output all | `[94,1536]` | BF16 | False | `1.51411638e-01` | `6.98168945e+00` | `1.24557646e-01` |
+| LLM hidden last | `[1,1536]` | BF16 | False | `3.84874612e-01` | `2.02636719e+00` | `6.92157758e-01` |
+| Stop logits | `[1,2]` | BF16 | False | `1.27172852e+00` | `1.49267578e+00` | `3.17428397e+00` |
+| DiT condition | `[1,1,1536]` | BF16 | False | `3.84874612e-01` | `2.02636719e+00` | `6.92157758e-01` |
+| DiT pre-context | `[1,1,20,64]` | BF16 | False | `5.51038096e-03` | `5.46875000e-02` | `6.76754781e-03` |
+| DiT noise | `[1,1,10,64]` | FP32 | False | `1.19862580e+00` | `4.45516777e+00` | `1.47074545e+00` |
+| DiT layer 0 / Euler step 0 | `[2,31,1024]` | BF16 | False | `5.48660420e-02` | `1.03320312e+00` | `3.65162318e-01` |
+| DiT solved | `[1,1,10,64]` | FP32 | False | `8.33342075e-01` | `3.15600204e+00` | `1.08113224e+00` |
+| First new patch | `[10,64]` | FP32 | False | `8.32816482e-01` | `3.15549254e+00` | `1.08153207e+00` |
+
+完整 158 项逐层结果：
+
+- `/data/tha/bitwise_runs/0817_npu7_20260820_1245/comparison.md`
+- `/data/tha/bitwise_runs/0817_npu7_20260820_1245/comparison.json`
+
+---
+
+## 6. 具体输入/输出数值
+
+## 6.1 Speaker Encoder
+
+### `speaker_raw`
 
 ```text
-connector latent [B, Tchunk, z_dim] fp32
-  -> fp32 反归一化
-  -> cast 到 AudioVAE dtype
-  -> decoder.fc1
-  -> one-chunk-lookahead upsample
-  -> Qwen2Packed Decoder
-  -> magnitude/phase projection
-  -> complex spectrum
-  -> ISTFT
-  -> overlap-add / flush tail
-  -> 必要时重采样
-  -> 24 kHz fp32 waveform
+纯模型:
+[0.4217047095, -0.3857417703, -0.5986943841, 0.0986975506,
+ 0.0883509070, 1.2812606096, 9.7324743271, 0.0947931930]
+
+vLLM-Omni:
+[0.4213241637, -0.3857730925, -0.5988527536, 0.0983870998,
+ 0.0897609815, 1.2821105719, 9.7299556732, 0.0954834521]
 ```
-
-### 9.2 整句与流式分支
-
-| 模式 | 判定 | Decoder 路径 | KV/流状态 |
-|---|---|---|---|
-| Single-shot | 首次输入就是 final chunk | `wavegan.decode()` | 不使用 `VAEDecoderKVPool`，不保留 OLA 状态 |
-| Streaming | 非 final，或已有流状态 | `decoder.forward_streaming()` | 使用 paged KV、lookahead、ISTFT OLA state |
-
-### 9.3 流式状态机
-
-```mermaid
-stateDiagram-v2
-    [*] --> New
-    New --> Buffered: 首个 latent chunk
-    Buffered --> Streaming: 后续 chunk 到达
-    Streaming --> Streaming: 写 Decoder KV并输出波形 delta
-    Buffered --> Flush: 首块同时为 final
-    Streaming --> Flush: is_last
-    Flush --> Done: 排空 lookahead与OLA尾部
-    Done --> [*]: release KV slot
-    Streaming --> Cancel: on_requests_finished
-    Cancel --> Done: deferred release
-```
-
-每请求 `_StreamState` 保存：
-
-- `slot`：Decoder KV pool slot；
-- `upsample_state`：lookahead 上采样状态；
-- `audio_buffer`、`window_buffer`：ISTFT overlap-add 尾部；
-- 累计 patch 数；
-- 累计 waveform sample 数。
-
-模型每次 forward 返回的是**当前 chunk 的 waveform delta**，不是从请求开始到当前时刻的累计波形。最终 API 的流式发送或离线聚合由上层输出处理链完成。
-
-关键证据：
-
-- `uniditar_code2wav.py:56-80`：流式状态；
-- `uniditar_code2wav.py:235-302`：Connector payload 解析；
-- `uniditar_code2wav.py:323-380`：Stage 1 forward；
-- `uniditar_code2wav.py:382-475`：single-shot/streaming 解码与状态回收。
-
----
-
-## 10. Runtime：Scheduler、Runner 与模型调用
-
-### 10.1 分层架构
-
-```mermaid
-flowchart TD
-    API[OpenAI/Omni API 请求]
-    PB[Prompt Builder + MM Processor]
-
-    subgraph E0[Stage 0 Engine Process]
-        SCH0[OmniARAsyncScheduler]
-        RUN0[GPUARModelRunner / NPUARModelRunner]
-        MOD0[UniDiTARTalker]
-        VKV[vLLM Qwen2 KV Manager]
-        SKV[SemanticKVPool]
-    end
-
-    SHM[SharedMemoryConnector]
-
-    subgraph E1[Stage 1 Engine Process]
-        SCH1[OmniGenerationScheduler]
-        RUN1[GPUGenerationModelRunner / NPUGenerationModelRunner]
-        MOD1[UniDiTARCode2Wav]
-        DKV[VAEDecoderKVPool]
-    end
-
-    OP[Output Processor]
-    CLIENT[Streaming/Final Audio]
-
-    API --> PB --> SCH0
-    SCH0 --> RUN0 --> MOD0
-    SCH0 <--> VKV
-    MOD0 <--> SKV
-    MOD0 --> SHM
-    SHM --> SCH1
-    SCH1 --> RUN1 --> MOD1
-    MOD1 <--> DKV
-    MOD1 --> OP --> CLIENT
-```
-
-### 10.2 关键调用链
-
-Stage 0：
 
 ```text
-API request
-  -> MM Processor / Prompt Builder
-  -> OmniARAsyncScheduler.schedule()
-  -> AR Runner input preparation
-  -> Talker.preprocess()
-  -> Talker.embed_multimodal()/embed_input_ids()
-  -> Talker.forward()
-  -> Qwen2Model.forward()
-  -> Talker.make_omni_output()
-  -> stop_head + MingDiT
-  -> Talker.compute_logits()
-  -> standard sampler selects token 1/2
-  -> async connector processor
+abs_mean      = 8.22384260e-04
+abs_max       = 2.51865387e-03
+relative_mean = 1.57660755e-03  (0.1577%)
 ```
 
-Stage 1：
+### `speaker_projected`
 
 ```text
-SharedMemoryConnector payload
-  -> OmniGenerationScheduler
-  -> Generation Runner
-  -> UniDiTARCode2Wav.forward()
-  -> payload bucket by Tchunk
-  -> AudioVAE.decode() or decoder.forward_streaming()
-  -> OmniOutput(multimodal_outputs={model_outputs, sr})
-  -> output processor / client
+纯模型:
+[0.1894531250, 0.0306396484, -0.1621093750, 0.1118164062,
+ 0.0634765625, 0.0081176758, -0.1240234375, -0.0417480469]
+
+vLLM-Omni:
+[0.1904296875, 0.0317382812, -0.1621093750, 0.1113281250,
+ 0.0634765625, 0.0085449219, -0.1245117188, -0.0412597656]
 ```
 
-Stage 1 `compute_logits()` 返回 `None`，说明它借用 `LLM_GENERATION` 的调度和执行框架，但自身没有 token logits 和 sampler。
+```text
+abs_mean      = 3.74971278e-04
+abs_max       = 1.95312500e-03
+relative_mean = 4.40523853e-03  (0.4405%)
+```
+
+## 6.2 AudioVAE latent
+
+### `acoustic_latent_raw_00`
+
+```text
+纯模型:
+[7.15625, 0.91796875, -3.03125, -3.421875,
+ -10.625, 6.5625, -7.5625, -2.46875]
+
+vLLM-Omni:
+[7.125, 0.94140625, -3.046875, -3.375,
+ -10.6875, 6.59375, -7.53125, -2.4375]
+```
+
+```text
+abs_mean      = 3.07773259e-02
+abs_max       = 4.37500000e-01
+relative_mean = 5.49650013e-03  (0.5497%)
+```
+
+## 6.3 Semantic
+
+### `semantic_final_00`
+
+```text
+纯模型:
+[-0.1484375, -1.4609375, -0.21875, -1.375,
+  0.455078125, -0.28125, 0.65234375, 0.126953125]
+
+vLLM-Omni:
+[-0.1484375, -1.4609375, -0.22265625, -1.375,
+  0.462890625, -0.283203125, 0.65234375, 0.125]
+```
+
+全 tensor 指标：
+
+```text
+abs_mean      = 1.06241441e+00
+abs_max       = 1.02656250e+01
+relative_mean = 8.76346550e-01
+```
+
+## 6.4 Aggregator
+
+### `aggregator_final_00`
+
+```text
+纯模型:
+[-0.0539550781, -0.3457031250, 0.7343750000, 0.0673828125,
+  0.6523437500, -0.3339843750, 0.0361328125, -0.0727539062]
+
+vLLM-Omni:
+[0.0996093750, -0.4570312500, 0.5664062500, -0.1337890625,
+ 0.8828125000, -0.0610351562, 0.0029754639, 0.0385742188]
+```
+
+```text
+abs_mean      = 2.95603216e-01
+abs_max       = 1.93750000e+00
+relative_mean = 8.70069771e-01
+```
+
+## 6.5 主 LLM
+
+### `llm_hidden_last_00`
+
+```text
+纯模型:
+[-0.26953125, 0.431640625, -0.21875, 1.234375,
+ -0.1176757812, -1.34375, 0.75390625, -1.0703125]
+
+vLLM-Omni:
+[-0.83984375, 0.73828125, -0.240234375, 1.046875,
+ -0.546875, -0.8515625, 0.1591796875, 0.134765625]
+```
+
+```text
+abs_mean      = 3.84874612e-01
+abs_max       = 2.02636719e+00
+relative_mean = 6.92157758e-01
+```
+
+### `stop_logits_00`
+
+```text
+纯模型:     [0.70703125, 0.09423828125]
+vLLM-Omni: [1.7578125, -1.3984375]
+```
+
+## 6.6 DiT
+
+### `dit_noise_00`
+
+```text
+纯模型:
+[-1.7243821621, 0.2750767469, -0.8882762790, 0.1296713650,
+  0.1773615628, -0.1681668609, 0.6441475153, 1.3264764547]
+
+vLLM-Omni:
+[0.3515823483, -1.4171410799, -0.8348867893, 0.3095704913,
+ -0.8153618574, 0.7267753482, -0.4442059398, 0.4116063714]
+```
+
+```text
+abs_mean      = 1.19862580e+00
+abs_max       = 4.45516777e+00
+relative_mean = 1.47074545e+00
+```
+
+### `dit_solved_00`
+
+```text
+纯模型:
+[-1.1308763027, 0.3084934950, -0.3360301852, -0.0353066623,
+  0.8751154542, -0.4382474422, 0.1229072809, 0.2629998922]
+
+vLLM-Omni:
+[-0.1718551368, -1.1217310429, -1.1072393656, -0.8623045087,
+ -0.6432698965, 1.5433986187, -0.7558378577, -0.5797131062]
+```
+
+### 最终 `first_new_patch`
+
+```text
+纯模型:
+[-1.1297454834, 0.3081850111, -0.3356941640, -0.0352713577,
+  0.8742403388, -0.4378091991, 0.1227843761, 0.2627368867]
+
+vLLM-Omni:
+[-0.171875, -1.125, -1.109375, -0.86328125,
+ -0.64453125, 1.546875, -0.75390625, -0.578125]
+```
+
+```text
+abs_mean      = 8.32816482e-01
+abs_max       = 3.15549254e+00
+relative_mean = 1.08153207e+00
+```
 
 ---
 
-## 11. KV Cache 架构
+## 7. 分歧来源分析
 
-### 11.1 三套 KV Cache 对比
+## 7.1 Speaker Encoder：首个直接数值分歧
 
-| Cache | Owner | 用途 | Layout/Block | 生命周期 | 是否由 vLLM KV Manager 管理 |
-|---|---|---|---|---|---|
-| Qwen2 LLM KV | Stage 0 vLLM | 文本和 acoustic soft token 的 AR attention | 由当前 vLLM attention backend 决定 | scheduler 分配、抢占、recompute、释放 | 是 |
-| Semantic KV | Stage 0 Talker | Whisper semantic encoder 跨 tick/跨轮缓存 | K/V 各为 `[L, blocks, block_size, kv_heads, head_dim]` | 模型 acquire；抢占时 rewind；archive replay；完成时 release | 否 |
-| VAE Decoder KV | Stage 1 Code2Wav | AudioVAE Qwen2 decoder 流式 causal attention | 同上；支持 sliding-window reclaim | 首个流 chunk acquire；每 chunk advance；final/cancel release | 否 |
+纯模型原始 mel 使用 STFT，但该算子在当前 NPU 不支持。验证脚本将其规范化为与 vLLM 相同的显式 DFT后，Speaker raw 相对误差为 0.1577%，说明：
 
-NPU 上模型自有 paged KV block size 固定为 128，以满足 Ascend FIA paged attention；CUDA 使用 vLLM 默认 block size。
+- 输入 waveform 已 EXACT；
+- mel 数学路径已统一；
+- 剩余差异来自 Conformer/Linear/Norm 等实现和 BF16/NPU kernel 舍入。
 
-### 11.2 模型自有 Paged KV
+这是当前自然流水线的第一个可直接比较的模型分歧。
 
-```mermaid
-flowchart LR
-    REQ[Request lifecycle]
-    SCHED[vLLM Scheduler]
-    LLMKV[Qwen2 vLLM KV]
-    TALKER[Talker]
-    SEMKV[SemanticKVPool]
-    ARCH[Latent Archive]
-    CONN[Connector]
-    C2W[Code2Wav]
-    DECKV[VAEDecoderKVPool]
+## 7.2 AudioVAE：网络误差与 posterior 随机性混合
 
-    REQ --> SCHED
-    SCHED --> LLMKV
-    SCHED --> TALKER
-    TALKER --> SEMKV
-    TALKER --> ARCH
-    SCHED -. preempt/recompute .-> TALKER
-    ARCH -. replay semantic .-> SEMKV
-    TALKER --> CONN --> C2W
-    C2W --> DECKV
-    DECKV -. sliding window reclaim .-> DECKV
-```
+VAE encoder 输出相对误差为 0.3641%，raw latent 相对误差为 0.5497%。这里同时包含：
 
-模型自有池的关键特征：
+1. 24 层 Qwen2 encoder 的算子差异；
+2. posterior `sample()` 的 NPU RNG状态差异。
 
-- 不注册为 vLLM KV cache group，`get_kv_cache_spec()` 看不到；
-- 地址固定，适合 Graph replay；
-- `block_table` 尾部填充 NULL block，`seq_lens` 限制真实可读范围；
-- `acquire()` 只占 slot，首次 `ensure_capacity()` 才分配 block；
-- `advance()` 在写入后推进真实长度；
-- `rewind()` 归还 block 并将长度清零；
-- Stage 1 sliding-window 可回收窗口之前的整块；
-- CUDA KV 写使用 `reshape_and_cache_flash`；NPU 使用 `index_copy_`。
+两侧虽然都设置 seed=42，但它们是独立进程，且模型初始化、warmup、请求路径消耗随机数的顺序不同，所以 `eps~N(0,1)` 不保证相同。
 
-Stage 0 在测量可用显存后按“一个 acoustic token 对应一个 LLM token和 `patch_size` 个 semantic frame”的成本比例，在 vLLM KV 与 SemanticKVPool 之间分配 KV memory pot。Stage 1 的 Decoder pool 则根据 `max_num_seqs`、单轮长度、最大 chunk 和 sliding window 估算 block 数。
+严格隔离 AudioVAE 网络精度时，应该分别比较：
 
-关键证据：
+- posterior mean；
+- posterior std；
+- 使用同一份 CPU-generated epsilon 的 latent。
 
-- `constants.py:30-65`
-- `paged_kv_cache_pool.py:3-18`
-- `paged_kv_cache_pool.py:78-214`
-- `paged_kv_cache_pool.py:225-360`
-- `paged_kv_cache_pool.py:425-449`
+## 7.3 Semantic：纯模型和 vLLM 的调用图不同
 
----
+纯模型实际推理路径会：
 
-## 12. Graph/编译运行架构
+1. `encode_audio(wav)` 调用一次 AudioVAE posterior sample；
+2. `encode_aggregation_input(wav)` 再次从 waveform 编码并调用 posterior sample；
+3. 第二份 acoustic latent 进入 Whisper semantic。
 
-### 12.1 Graph 边界
+当前 vLLM `_prompt_encode()` 只做一次 AudioVAE sample，并让 acoustic 和 semantic 共用该 latent。
 
-UniDiTAR 使用“外层 eager + 内层 bucket graph”的策略。
+因此，Semantic 的输入在自然路径上不是同一个 tensor。这解释了 Semantic 层误差快速放大，并进一步污染 Aggregator 和 LLM。
 
-**保持 eager 的部分：**
+这属于**执行图/随机调用次数差异**，不能只归因于 NPU FIA 精度。
 
-- Python 请求状态机；
-- 请求 finish/cancel/preemption 处理；
-- Connector payload 组装；
-- 形状分桶和 KV block 分配；
-- SDE/初始噪声生成；
-- Stage 1 lookahead/ISTFT OLA 的部分编排；
-- 最终输出对象组装。
+## 7.4 Bucket padding
 
-**可按 bucket 入图的部分：**
+vLLM 即使处于 eager，也复用 GraphSlot 静态 buffer：
 
-- Stage 0 Qwen2 主模型；
-- Whisper semantic encoder；
-- MingAggregator；
-- MingDiT 完整 Euler solver 循环；
-- AudioVAE encoder；
-- Speaker Conformer；
-- Stage 1 streaming AudioVAE decoder backbone。
+- Semantic 240→256；
+- Aggregator 24→32。
 
-### 12.2 Capture/Replay 流程
+报告已经按真实长度裁剪 padding。padding 本身不是误差来源，但若不裁剪会导致 shape 无法比较。
 
-```mermaid
-flowchart TD
-    LOAD[load_weights 完成]
-    FUSION{NPU?}
-    PROBE[NPU fusion capability probe]
-    REGISTER[注册 Qwen2 wrapper 与 GraphSlot buckets]
-    PLAN[预估 graph static/capture memory]
-    CAPTURE[Runner capture_model]
-    VGRAPH[vLLM CUDA Graph / ACLGraph]
-    CUSGRAPH[UniDiTAR CUDAGraph / NPUGraph]
+## 7.5 主 LLM
 
-    RUN[请求运行]
-    KEY[根据 B/T/模式选择 bucket]
-    HIT{bucket 已成功 capture?}
-    FILL[填充固定地址 static buffers]
-    REPLAY[Graph replay]
-    UPDATE[NPU paged FIA task update]
-    EAGER[eager body]
-    OUT[切片/clone 输出]
+LLM 的输入已受到 Speaker、Semantic、Aggregator 差异影响，因此本次 `llm_hidden_last` 的 69.2% 相对误差是自然端到端传播结果，不等价于主 LLM 单独算子误差。
 
-    LOAD --> FUSION
-    FUSION -->|是| PROBE --> REGISTER
-    FUSION -->|否| REGISTER
-    REGISTER --> PLAN --> CAPTURE
-    CAPTURE --> VGRAPH --> CUSGRAPH
+要测主 LLM 纯算子精度，需要向两侧注入完全相同的 `inputs_embeds`，再逐层比较。
 
-    RUN --> KEY --> HIT
-    HIT -->|否| EAGER --> OUT
-    HIT -->|是| FILL --> REPLAY
-    REPLAY -->|NPU paged FIA| UPDATE --> OUT
-    REPLAY -->|其他| OUT
-```
+## 7.6 DiT：初始 noise 不同，当前 solved diff不能代表 DiT op精度
 
-`GraphSlot` 的语义：
+两侧 DiT noise 相对误差为 147.1%，已经是完全不同的随机样本。再叠加 condition/pre-context 差异后，最终 patch 非 exact 是必然结果。
 
-1. 注册 bucket 不代表已经 capture；
-2. `capture_all()` 在 Runner 的启动 capture window 中逐 bucket 捕获；
-3. 某个 bucket 捕获失败时，只将该 bucket 标记为失败并回退 eager；
-4. 运行时只有 `entry.graph != None` 才 replay；
-5. 带 KV 写副作用的 slot 必须提供 snapshot guard，避免 dummy capture 污染真实 cache；
-6. Graph 运行会记录 hit、miss 和 split/fallback 统计。
+严格 DiT op 对齐必须同时注入：
 
-### 12.3 NPU paged FIA 动态更新
+- 相同 condition；
+- 相同 pre-context；
+- 相同 FP32 noise；
+- 相同 times/alpha schedule；
+- 相同 solver step 数。
 
-NPU paged attention 的真实 KV 长度和 block table 每个请求、每个 tick 都会变化。当前代码在 capture 时记录 FIA graph task；replay 时：
-
-1. 更新固定地址 buffer；
-2. enqueue `NPUGraph.replay()`；
-3. 在独立 NPU stream 上调用 `fia_paged_update()`；
-4. 使用当前 `actual_seq_lengths_kv` 和 `block_table` 动态重绑各层 task；
-5. 通过 stream/event 依赖保证更新和 replay 顺序。
-
-因此，`deploy/uniditar.yaml:83-85` 中“Semantic paged-FIA remains eager until updater is enabled”的注释与当前代码已有 updater 的事实不一致，应视为陈旧注释，而不是当前能力边界。
-
-关键证据：
-
-- `graph_bucket_pool.py:187-280`：命中、回退、CUDA/NPU capture；
-- `graph_bucket_pool.py:371-459`：集中注册和捕获；
-- `platforms/npu/ops/uniditar_flash_attn.py`：paged FIA task 记录和动态更新；
-- `uniditar_talker.py`：Talker 子图注册；
-- `audio_vae/decoder.py`：Stage 1 decoder GraphSlot；
-- `uniditar_code2wav.py:519-552`：Stage 1 capture 入口。
+当前 `dit_solved` 和 `first_new_patch` 指标只能说明自然运行路径不同，不能说明 MingDiT 本身精度差。
 
 ---
 
-## 13. CUDA 与 NPU 平台差异
+## 8. 与 GPU Bitwise 报告的对应关系
 
-| 能力 | CUDA | NPU |
+GPU 报告中，各模块通过以下方法达到 EXACT：
+
+- fixed epsilon；
+- reference input injection；
+- CPU 构造 RoPE cache；
+- 统一 RMSNorm/RoPE/Attention 实现；
+- 固定 DiT noise；
+- 模块入口使用干净 HF dump。
+
+NPU 当前自然运行结果与 GPU 报告“未注入前”的含义相同。若要求 NPU 也达到模块级 EXACT，下一步应使用本次真实 dump 继续做以下注入矩阵：
+
+| 实验 | 注入内容 | 验证目标 |
 |---|---|---|
-| Architecture 加载 | Portable `uniditar` 实现 | Platform 将 architecture 路由到 NPU overlay；overlay 通过扩展 `__path__` 回退 portable 模块 |
-| 主 LLM 图 | `CUDAGraphWrapper` | `ACLGraphWrapper` |
-| 自定义 bucket 图 | `torch.cuda.CUDAGraph` | `torch.npu.NPUGraph` |
-| DiT attention | PyTorch SDPA/portable 路径 | Ascend FIA 路径 |
-| Semantic/Decoder attention | vLLM FlashAttention | UniDiTAR FIA adapter |
-| 模型自有 KV block | vLLM 默认 block size | 固定 128 |
-| KV write | `reshape_and_cache_flash` | `index_copy_` |
-| Paged Graph metadata | 更新静态 tensor 内容 | 还需 FIA graph task 动态重绑长度和 block table |
-| Graph pool | CUDA graph pool | `torch.npu.graph_pool_handle()` |
-| 融合策略 | Portable kernel/编译器 | 权重加载后、capture 前 capability probe + monkey patch |
+| A | fixed posterior epsilon | AudioVAE encoder网络误差 |
+| B | pure acoustic latent | Whisper Semantic |
+| C | pure semantic normalized | Aggregator |
+| D | pure aggregator output / inputs_embeds | 主 LLM |
+| E | pure hidden_last | stop head 与 DiT condition |
+| F | pure condition + pre-context + noise | MingDiT/solver |
 
-当前 NPU overlay 目录本身主要提供包路由，模型主体仍来自 portable `uniditar`。平台差异集中在：
+验收时应区分：
 
-- NPU Runner；
-- FIA adapter；
-- ACLGraph/NPUGraph；
-- KV block 限制；
-- 权重加载后的融合安装器。
-
-### 13.1 NPU 融合算子
-
-`uniditar_installer.py` 在权重加载后、Graph capture 前尝试安装：
-
-- packed QKV attention；
-- Qwen2 RMSNorm；
-- Qwen2 SwiGLU；
-- DiT Linear + GELU；
-- DiT/Conformer FIA v2；
-- DiT fused RoPE；
-- standalone LayerNorm；
-- residual Add + RMSNorm；
-- residual Add + LayerNorm。
-
-大部分融合先用小输入与 native/fp32 reference 做 capability/数值 probe，失败则保留 portable 实现；packed-QKV 主要检查 dtype、device 和 shape，数值保护相对较弱。
+- natural end-to-end；
+- module-clean-input；
+- op-clean-input；
+- task benchmark。
 
 ---
 
+## 9. 当前 Bitwise 判定
 
+| 模块 | 自然路径 bitwise | 当前证据 |
+|---|---|---|
+| 输入 waveform | 通过 | `torch.equal=True` |
+| Frame count | 通过 | 两端均为 240 |
+| Speaker Encoder | 未通过 | 首个数值分歧，相对误差 0.1577% |
+| AudioVAE Encoder | 未通过 | 网络和 posterior RNG均有差异 |
+| Semantic | 未通过 | 输入 latent和调用次数不同 |
+| Aggregator | 未通过 | 上游 Semantic差异传播 |
+| 主 LLM | 未通过 | 上游 inputs_embeds不同，Paged KV实现不同 |
+| Stop head | 未通过 | hidden_last不同 |
+| MingDiT | 未通过 | condition、pre-context、noise均不同 |
+| First patch | 未通过 | relative mean 108.15% |
+| 任务级质量 | 基本一致 |  benchmark实测 |
 
-## 15. 流式时序与生命周期
+最终结论：
 
-### 15.1 首包
-
-1. Stage 0 解析文本和参考音频；
-2. AudioVAE Encoder、Speaker Encoder、Semantic Encoder 处理 prompt；
-3. Qwen2 完成 prefill；
-4. 第一个 AR decode tick 运行 stop head 和 MingDiT；
-5. Connector 按 `chunk_M` 判断是否发送；当前 YAML 中 `M=1`，因此立即发送；
-6. Stage 1 创建 `_StreamState` 和 Decoder KV slot；
-7. 首个 chunk 可能因 one-chunk-lookahead 只建立状态，实际可输出样本量取决于 decoder streaming 逻辑。
-
-### 15.2 稳态
-
-1. Talker 每 tick 追加一 patch latent；
-2. SemanticKVPool 写入 `patch_size` 个 semantic frame；
-3. Qwen2 vLLM KV 追加一个 acoustic token；
-4. Code2Wav Decoder KV 追加 latent frame；
-5. Stage 1 输出当前波形 delta，保留 lookahead 和 OLA 尾部。
-
-### 15.3 结束与清理
-
-- Stop head 超阈值或达到最大 decode 长度后，Talker 生成 EOS 合成 token；
-- Connector flush 剩余 latent；没有剩余时发送空 latent EOF；
-- Stage 1 排空 lookahead/OLA 尾部；
-- `is_last` 后释放 Decoder KV slot；
-- Talker 在请求完成回调后释放 semantic slot 和请求状态；
-- cancel 路径通过 deferred drop 避免在最后一个 payload 解码前过早释放 Stage 1 状态。
-
-
+> **当前 UniDiTAR NPU vLLM-Omni 与纯模型在 B1/BF16/eager/无Graph/无后加载融合的自然首 patch 路径下未达到 bitwise EXACT。输入 waveform和帧数完全一致；首个模型数值分歧位于 Speaker Encoder。后续差异主要由纯模型重复 posterior sample、两端独立 RNG、不同 attention/cache执行图和上游误差传播造成。**
 
 ---
 
-## 19. 一句话总结
-
-UniDiTAR 的本质是一个以 **Qwen2 AR hidden state 驱动 flow-matching DiT 逐 patch 生成声学 latent，再由流式 AudioVAE 解码为 24 kHz 波形**的两阶段 TTS 系统；vLLM-Omni 负责 Stage 调度、Qwen2 KV 和跨 Stage 传输，模型自身额外管理 semantic/decoder 两套 paged KV，并通过 CUDA Graph 或 ACLGraph/NPUGraph 对固定 shape 的内部计算热点进行分桶加速。
