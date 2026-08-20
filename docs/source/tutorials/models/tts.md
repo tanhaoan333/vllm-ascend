@@ -568,3 +568,381 @@ NPU 当前自然运行结果与 GPU 报告“未注入前”的含义相同。�
 
 ---
 
+## 10. Speaker Encoder 输出注入实验
+
+### 10.1 实验方法
+
+为判断修正 Speaker Encoder 后下游模块是否正确，本次在同一 NPU7、同一请求和同一 Eager 配置下执行第二轮实验：
+
+1. 从纯模型基线加载 `speaker_raw.pt`；
+2. 在 vLLM-Omni 的 `speaker_encoder.forward()` 出口精确替换；
+3. 其余输入、权重、seed、BF16、B1、无 Graph、无后加载融合条件不变；
+4. 重新比较全部 158 个匹配节点。
+
+环境变量：
+
+```bash
+UNIDITAR_PRECISION_INJECT=speaker_raw
+UNIDITAR_PRECISION_HF_DIR=/data/tha/bitwise_runs/0817_npu7_20260820_1245/hf
+```
+
+日志证据：
+
+```text
+UniDiTAR precision dumps enabled at .../vllm; injections=['speaker_raw']
+POST /v1/audio/speech HTTP/1.1 200 OK
+```
+
+实验产物：
+
+- `/data/tha/bitwise_runs/0817_npu7_speaker_inject_20260820_1416/`
+- `comparison.md`
+- `comparison.json`
+- `server.log`
+
+### 10.2 Speaker 分支结果
+
+| 节点 | 自然基线 abs_mean | 注入后 abs_mean | 注入后 exact |
+|---|---:|---:|---:|
+| `speaker_raw` | `8.22384260e-04` | `0` | **True** |
+| `speaker_projected` | `3.74971278e-04` | `0` | **True** |
+
+结论：
+
+- 纯模型 `speaker_raw` 已成功精确接入；
+- `spkr_proj` 在相同输入下逐 bit EXACT；
+- 所以 Speaker Encoder 后面的 speaker projection 模块本身正确；
+- exact tensor 数由 2 增加到 4，新增项正是 `speaker_raw` 和 `speaker_projected`。
+
+### 10.3 下一个差异模块
+
+Speaker 注入后，AudioVAE 分支误差完全不变：
+
+| 节点 | 自然基线 abs_mean | 注入后 abs_mean | 注入后 relative_mean |
+|---|---:|---:|---:|
+| `vae_encoder_output_00` | `2.12574732e-02` | `2.12574732e-02` | `3.64127862e-03` |
+| `acoustic_latent_raw_00` | `3.07773259e-02` | `3.07773259e-02` | `5.49650013e-03` |
+| `prompt_acoustic_normalized` | `5.16233547e-03` | `5.16233547e-03` | `6.70999612e-03` |
+
+因此：
+
+> **正确接入 Speaker Encoder 输出后，后续全链路仍未对齐；下一个独立产生差异的模块是 AudioVAE Encoder，而不是 `spkr_proj`。**
+
+原因是 Speaker 和 AudioVAE 是并行分支：
+
+```text
+prompt waveform
+  ├─► Speaker Encoder ─► spkr_proj ─► LLM speaker token
+  └─► AudioVAE Encoder ─► acoustic latent ─► Semantic ─► Aggregator
+```
+
+修正 Speaker 不会改变 AudioVAE/Semantic 分支。
+
+### 10.4 下游模块变化
+
+| 节点 | 自然基线 abs_mean | Speaker注入后 abs_mean | 结论 |
+|---|---:|---:|---|
+| `semantic_layer_00_00` | `1.05030859e+00` | `1.05030859e+00` | 完全不变 |
+| `semantic_final_00` | `1.06241441e+00` | `1.06241441e+00` | 完全不变 |
+| `aggregator_final_00` | `2.95603216e-01` | `2.95603216e-01` | 完全不变 |
+| `llm_output_all_00` | `1.51411638e-01` | `1.51221663e-01` | 略有改善但仍未对齐 |
+| `llm_hidden_last_00` | `3.84874612e-01` | `3.86591285e-01` | 仍未对齐 |
+| `stop_logits_00` | `1.27172852e+00` | `1.27954102e+00` | 仍未对齐 |
+| `dit_noise_00` | `1.19862580e+00` | `1.19862580e+00` | 完全不变 |
+| `dit_solved_00` | `8.33342075e-01` | `8.32571626e-01` | 仍未对齐 |
+| `first_new_patch` | `8.32816482e-01` | `8.32165837e-01` | 仍未对齐 |
+
+Semantic、Aggregator 和 DiT noise 的误差完全不变，证明它们的主要差异与 Speaker 分支无关。
+
+### 10.5 定位结论与下一步
+
+当前定位链为：
+
+```text
+Speaker Encoder
+  ├─ 注入后 speaker_raw EXACT
+  └─ spkr_proj EXACT，确认正确
+
+AudioVAE Encoder
+  └─ 下一处真实差异
+       encoder output relative_mean    = 0.3641%
+       raw latent relative_mean        = 0.5497%
+       normalized latent relative_mean = 0.6710%
+
+Semantic / Aggregator / LLM / DiT
+  └─ 继续受 AudioVAE 分支和独立 RNG 影响
+```
+
+下一步应固定 AudioVAE posterior epsilon，分别判断：
+
+1. 24 层 AudioVAE Encoder 网络是否一致；
+2. posterior mean/std 是否一致；
+3. 仅随机 epsilon 是否导致 latent 差异；
+4. 注入 acoustic latent 后，Semantic 的首个真实差异位置。
+
+---
+
+## 11. AudioVAE Encoder 逐 Op 定位与注入
+
+### 11.1 首个具体差异 Op
+
+在相同 waveform 下增加以下检查点：
+
+```text
+frames → fc1 → pre_qwen2_ln → fc2 → residual
+→ layer0 input RMSNorm → Attention → post RMSNorm → MLP
+```
+
+真实结果：
+
+| 节点 | exact | abs_mean | abs_max | relative_mean |
+|---|---:|---:|---:|---:|
+| `vae_fc1_00` | True | `0` | `0` | `0` |
+| `vae_pre_qwen2_ln_00` | True | `0` | `0` | `0` |
+| `vae_fc2_00` | True | `0` | `0` | `0` |
+| `vae_layer_00_input_rmsnorm_00` | False | `3.23905879e-05` | `3.90625000e-03` | `1.40791598e-03` |
+| `vae_layer_00_attention_out_00` | False | `6.08599476e-05` | `1.25000000e-01` | `3.84678781e-04` |
+| `vae_layer_00_output_00` | False | `8.84036708e-04` | `2.50000000e-01` | `4.74132300e-04` |
+
+因此 AudioVAE Qwen2 的首个具体差异是：
+
+> **第 0 层 input RMSNorm。纯模型使用 Transformers Qwen2 RMSNorm 分步 FP32 reduction；vLLM NPU 使用 `torch_npu.npu_rms_norm`。两者 reduction/cast 顺序不同。**
+
+### 11.2 正确输出累计替换
+
+实验将以下纯模型输出逐项替换至 vLLM：
+
+- 24 层 input RMSNorm；
+- Attention output；
+- post-attention RMSNorm；
+- MLP output；
+- 每层 block output；
+- backbone final norm；
+- `fc3`；
+- posterior acoustic sample；
+- normalized acoustic latent。
+
+结果：
+
+| 节点 | 注入后结果 |
+|---|---:|
+| 24 层所有已记录 Op | **EXACT** |
+| `vae_layer_23_output_00` | **EXACT** |
+| `vae_backbone_final_norm_00` | **EXACT** |
+| `vae_fc3_00` | **EXACT** |
+| `vae_encoder_output_00` | **EXACT** |
+| `acoustic_latent_raw_00` | **EXACT** |
+| `prompt_acoustic_normalized` | **EXACT**，额外注入后消除 `1.47e-08` 的 sqrt/除法舍入 |
+
+实验目录：
+
+- `/data/tha/bitwise_runs/0817_npu7_vae_inject_20260820_1434/`
+
+结论：AudioVAE 下游可继续对齐；其网络首差异由 NPU RMSNorm 开始，posterior RNG 是另一独立差异源。
+
+---
+
+## 12. Whisper Semantic 逐 Op 定位与修正
+
+### 12.1 纯模型参考环境缺少 torchtune
+
+定位过程中发现容器内：
+
+```text
+_TORCHTUNE_AVAILABLE = False
+ModuleNotFoundError: No module named 'torchtune'
+```
+
+纯模型因此静默设置：
+
+```text
+rotary_embed = None
+```
+
+这不是正确 HF-reference 路径。验证脚本补入了 torchtune 等价 interleaved RoPE：
+
+- CPU FP32 生成 theta/cos/sin cache；
+- cache 搬到 NPU不改变 bit；
+- `x.float()` 上执行逐项 mul/sub/add；
+- 最终 cast 回 BF16。
+
+此修正仅存在于验证脚本，没有修改纯模型仓库。
+
+### 12.2 Semantic 前处理首差异
+
+在注入纯模型第二次 AudioVAE sample，即 `acoustic_latent_raw_01` 后，输入已 `torch.equal=True`。但 vLLM 使用 256 bucket，纯模型使用真实 T=240，导致同一 Linear 在不同 M 维 tiling 下产生差异：
+
+| 节点 | abs_mean | abs_max | relative_mean |
+|---|---:|---:|---:|
+| `semantic_pre_fc1_00` | `9.57778376e-03` | `1.0` | `1.29133239e-03` |
+| `semantic_pre_gelu_00` | `4.68040118e-03` | `1.0` | `1.28894889e-03` |
+| `semantic_pre_fc2_00` | `2.13330165e-02` | `2.5e-01` | `2.65754871e-03` |
+
+将三处正确输出注入后，它们全部 EXACT，且第 0 层 `attn_ln` 也 EXACT。
+
+### 12.3 首个 Attention 内部差异：RoPE
+
+在相同 LayerNorm 和相同 Q/K/V 投影下：
+
+| 节点 | exact | abs_mean | abs_max | relative_mean |
+|---|---:|---:|---:|---:|
+| Q pre-RoPE | True | `0` | `0` | `0` |
+| K pre-RoPE | True | `0` | `0` | `0` |
+| V | True | `0` | `0` | `0` |
+| Q post-RoPE | False | `1.27340003e-03` | `1.25e-01` | `9.73854278e-04` |
+| K post-RoPE | False | `1.23863958e-03` | `6.25e-02` | `9.89396494e-04` |
+| Attention output | False | `1.91501540e-03` | `2.0` | `4.04590111e-04` |
+
+具体原因与 GPU报告一致：
+
+- 纯参考：torchtune 逐 Op FP32 RoPE；
+- vLLM：`_DiffusionRotaryEmbedding` 平台实现；
+- cache 构造设备和 kernel 中间舍入不同。
+
+### 12.4 注入正确 RoPE 后
+
+只注入每层 Q/K 的正确 post-RoPE，保持 NPU FIA Attention 不变：
+
+| 节点 | 结果 |
+|---|---:|
+| Q/K post-RoPE | **EXACT** |
+| 第 0 层 Attention output | **EXACT** |
+| 第 0 层 MLP output | **EXACT** |
+| 第 0 层 block output | **EXACT** |
+| 第 31 层 block output | **EXACT** |
+| `semantic_final_00` | **EXACT** |
+
+这证明：
+
+> **在 B1 prefill 条件下，正确 RoPE 输入接入后，当前 NPU FIA 与纯模型 Attention 输出可以达到 bitwise EXACT；Semantic 的核心差异来自前处理 bucket GEMM和RoPE，而不是 FIA本身。**
+
+实验目录：
+
+- `/data/tha/bitwise_runs/0817_npu7_rope_inject_20260820_1535/`
+
+---
+
+## 13. Aggregator 定位与注入
+
+在 Semantic 32 层全部 EXACT 后，Aggregator 首个差异位于第 0 层 `norm1`：
+
+| 节点 | abs_mean | abs_max | relative_mean |
+|---|---:|---:|---:|
+| `aggregator_layer_00_norm1_00` | `3.04514259e-07` | `7.8125e-03` | `3.79918860e-07` |
+| `aggregator_layer_00_attention_out_00` | `1.75193315e-06` | `1.953125e-03` | `1.72994943e-05` |
+| `aggregator_layer_00_output_00` | `9.82590427e-06` | `3.90625e-03` | `4.69642207e-05` |
+| `aggregator_final_00` | `1.28755847e-03` | `3.125e-02` | `3.75738247e-03` |
+
+首差异 Op 同样是：
+
+```text
+NPU npu_rms_norm vs 纯模型分步 RMSNorm
+```
+
+注入 8 层 norm1/Attention/norm2/MLP/block和 Aggregator final 后：
+
+- 8 层全部 EXACT；
+- `aggregator_final_00` EXACT。
+
+实验目录：
+
+- `/data/tha/bitwise_runs/0817_npu7_aggregator_optrace_20260820_1540/`
+
+---
+
+## 14. 主 LLM、Stop Head 与 DiT Clean-input
+
+### 14.1 主 LLM
+
+vLLM Qwen2 每层内部返回 `(hidden_states, residual)` 分解，而纯 Transformers Qwen2 hook看到的是合并后的 hidden。两者内部原始表示不能直接用同一个单 tensor语义比较。
+
+验证分别完成了：
+
+1. 注入每层纯模型 hidden，确认对应层输出检查点可以 EXACT；
+2. 在 `make_omni_output` 前注入完整 `llm_output_all`，绕开 residual分解和 final norm协议差异。
+
+结果：
+
+| 节点 | 结果 |
+|---|---:|
+| `llm_output_all_00` | **EXACT** |
+| `llm_hidden_last_00` | **EXACT** |
+| `stop_logits_00` | **EXACT** |
+| `dit_condition_00` | **EXACT** |
+
+Stop Head 在相同 hidden 下无需任何替换即可 EXACT，说明其 Linear 实现正确。
+
+### 14.2 DiT Clean-input
+
+在以下输入全部 EXACT 后：
+
+- condition；
+- pre-context；
+- FP32 noise；
+- times/alpha schedule；
+- solver steps；
+
+DiT 仍有小误差：
+
+| 节点 | abs_mean | abs_max | relative_mean |
+|---|---:|---:|---:|
+| `dit_layer_00_norm1_00` | `4.91977960e-04` | `3.125e-02` | `6.08990647e-04` |
+| `dit_layer_00_attention_out_00` | `8.63841342e-05` | `7.8125e-03` | `6.76737650e-04` |
+| `dit_layer_00_output_00` | `3.50312475e-04` | `1.5625e-02` | `2.32989068e-03` |
+| `dit_layer_07_output_00` | `1.58124208e-03` | `1.25e-01` | `6.50572086e-03` |
+| `dit_solved_00` | `6.30022585e-03` | `2.63942629e-02` | `8.10148663e-03` |
+| `first_new_patch` | `6.38788054e-03` | `2.63577793e-02` | `8.22242457e-03` |
+
+首差异再次位于第 0 层 `norm1`，即 NPU RMSNorm。
+
+---
+
+## 15. 最终累计 Bitwise EXACT 实验
+
+最终实验将所有已经定位的差异边界依次替换为纯模型正确数据：
+
+```text
+speaker_raw
+→ AudioVAE 24层Qwen各Op
+→ acoustic raw / normalized latent
+→ Semantic第二次acoustic输入
+→ Semantic fc1/GELU/fc2
+→ Semantic Q/K RoPE
+→ Aggregator 8层各Op
+→ LLM final hidden
+→ DiT noise
+→ DiT 8层各Op
+→ DiT solved
+→ first patch
+```
+
+最终核心链路结果：
+
+| 节点 | exact | abs_mean | abs_max |
+|---|---:|---:|---:|
+| `speaker_raw` | True | `0` | `0` |
+| `speaker_projected` | True | `0` | `0` |
+| `vae_encoder_output_00` | True | `0` | `0` |
+| `acoustic_latent_raw_00` | True | `0` | `0` |
+| `prompt_acoustic_normalized` | True | `0` | `0` |
+| `semantic_final_00` | True | `0` | `0` |
+| `aggregator_final_00` | True | `0` | `0` |
+| `llm_output_all_00` | True | `0` | `0` |
+| `llm_hidden_last_00` | True | `0` | `0` |
+| `stop_logits_00` | True | `0` | `0` |
+| `dit_condition_00` | True | `0` | `0` |
+| `dit_pre_context_00` | True | `0` | `0` |
+| `dit_noise_00` | True | `0` | `0` |
+| `dit_layer_00_norm1_00` | True | `0` | `0` |
+| `dit_layer_07_08` | True | `0` | `0` |
+| `dit_solved_00` | True | `0` | `0` |
+| `first_new_patch` | True | `0` | `0` |
+
+最终实验自动匹配 895 个节点，其中 866 个直接 EXACT。剩余节点是：
+
+- `prompt_token_ids`：prefix-only INT64 与 full-packed INT32 的scope/dtype差异，数值前缀差为0；
+- 28个 vLLM Qwen layer raw hook：vLLM `(hidden,residual)`内部协议与纯模型合并hidden语义不同。
+
+这些辅助表示不影响最终功能链；`llm_output_all`、`hidden_last`、Stop Head、DiT和首 patch已全部 EXACT。
+
+
