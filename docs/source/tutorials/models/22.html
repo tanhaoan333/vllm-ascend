@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TTS-Codec · 模型结构与 NPU 执行详图</title>
+<style>
+:root{color-scheme:light;--ink:#142b42;--muted:#53697d;--line:#d8e2ec;--bg:#f3f6fa;--blue:#2166ac;--green:#087e72}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.7 system-ui,-apple-system,"Segoe UI","Noto Sans CJK SC","Microsoft YaHei",sans-serif}header{background:#10283f;color:#fff;padding:48px max(5vw,24px) 38px}header .eyebrow{color:#7ddad0;letter-spacing:.16em;font-size:12px}h1{font-size:34px;line-height:1.3;margin:12px 0}header p{max-width:1050px;color:#c6d5e3}main{max-width:1530px;margin:auto;padding:24px}.meta,.legend{display:flex;gap:10px;flex-wrap:wrap}.pill{border:1px solid #526a80;border-radius:20px;padding:3px 13px;font-size:12px}.intro,.panel,.sources{background:white;border:1px solid var(--line);border-radius:14px;margin-bottom:22px;padding:24px}.intro p{margin:8px 0}code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:#eef3f8;padding:1px 5px;border-radius:4px;overflow-wrap:anywhere}nav{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}nav a{color:var(--blue);text-decoration:none;padding:5px 12px;background:#e9f1fa;border-radius:6px;font-size:13px}a{color:var(--blue)}h2{font-size:23px;margin:0 0 8px}h3{font-size:17px}.sub{color:var(--muted);margin:0 0 16px}.toolbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 0;font-size:13px}.toolbar input{width:160px;accent-color:var(--blue)}button{border:1px solid #b9ccde;border-radius:6px;padding:6px 14px;background:#fff;color:#164f84;cursor:pointer}button:hover{background:#edf5fc}.canvas{overflow:auto;border:1px solid #e0e8f0;border-radius:9px;background:#fff}.canvas svg{display:block;width:100%;min-width:960px;height:auto}.notes{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px;margin-top:16px}.note{border-left:3px solid #80a7ca;background:#f6f9fc;padding:12px 16px}.note strong{display:block}.note p{margin:3px 0;color:#435a70;font-size:14px}.source-links{margin-top:14px;font-size:12px;color:var(--muted)}.source-links a{margin-right:12px}.legend span{font-size:12px;border-radius:5px;padding:4px 10px;border:1px solid var(--line)}.legend .proj{background:#eaf3ff}.legend .attn{background:#f0ecff}.legend .moe{background:#fff3df}.legend .conv{background:#e8f7f0}.legend .cache{background:#fff0f5}.legend .opt{background:#e7f8f5;border-style:dashed}.warning{border-left:4px solid #d79835;padding:12px 16px;background:#fff8e9}.sources ol{padding-left:24px}.sources li{margin:12px 0}.sources small{display:block;color:var(--muted)}.wtable{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px}.wtable th,.wtable td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}.wtable th{background:#eef3f8}.wtable td:first-child{white-space:nowrap;font-weight:600}@media(max-width:900px){.wtable td:first-child{white-space:normal}}footer{padding:10px 24px 40px;text-align:center;color:var(--muted);font-size:13px}section{scroll-margin-top:18px}@media(max-width:700px){main{padding:12px}.intro,.panel,.sources{padding:16px}header{padding:30px 20px}h1{font-size:27px}.notes{grid-template-columns:1fr}}@media print{header{background:white;color:#142b42;padding:15px}header p{color:#53697d}main{padding:0;max-width:none}.toolbar,nav{display:none}.panel{break-before:page;border:0;padding:10px}.canvas{overflow:visible;border:0}.canvas svg{min-width:0;width:100%!important}.notes{display:block}.note{break-inside:avoid;margin-top:8px}body{background:white}.intro{border:0}.sources{break-before:page}}
+</style>
+</head>
+<body>
+<header><div class="eyebrow">UNIDITAR / ARCHITECTURE ATLAS / ASCEND NPU</div><h1>TTS-Codec 模型结构详图</h1><p>从文本与参考音频，到自回归 Codec Token、Chunk-AR Flow Matching，再到波形。逐层展开 Q / K / V、输出投影、归一化、残差、MoE 路由，以及 FlashAttention 的分块计算原理。</p><div class="meta"><span class="pill">2026-10-13 代码快照</span><span class="pill">vllm-omni HEAD 6eab233a9 + 当前未提交修改</span><span class="pill">权重：tha/hy3_a3b_codec</span><span class="pill">纯离线 · 矢量图 · 可导出 SVG</span></div></header>
+<main>
+<section class="intro"><h2>阅读约定</h2><p><strong>模型算子图 ≠ kernel 时间线。</strong>一个逻辑框不一定对应一个 kernel；NPU 可以融合多个框。虚线表示条件、缓存或实现映射，不代表新增网络层。</p><p><strong>模型权重基准：</strong><code>tha/hy3_a3b_codec</code>。Stage 0 以 <code>hf_model/</code> 为模型目录（含 Talker、Whisper fbank encoder、speaker_adaptor、<code>audio_encoder/config.json</code>）；loader 按 <code>&lt;model&gt;/../decoder</code> 加载 Stage 1 的 <code>decoder/</code>。图中所有尺寸均已用这些目录的 config 与 safetensors header（只读、未加载张量）交叉核对；部署参数来自 <code>vllm_omni/deploy/uniditar_tts_codec.yaml</code>。<code>hf_llm_model/</code> 是另行导出的纯 LLM 产物（排除 fbank_encoder / speaker_adaptor / audio_codec_tokenizer），不在本 TTS 两阶段图的加载路径上。</p>
+<table class="wtable"><thead><tr><th>组件（权重目录）</th><th>参数量</th><th>存储</th><th>已核对的关键形状</th></tr></thead><tbody>
+<tr><td>Talker HYV3（hf_model: model.* + lm_head）</td><td>30.15B 总量；每 token 激活约 2.96B（不含 embedding 与 head），含二者约 3.54B</td><td>BF16 56.2 GiB</td><td>q/k/v/o：[4096,2048]/[512,2048]/[512,2048]/[2048,4096] ×48；layer0 dense 6912；47 层 × 128 experts [768,2048]；shared_mlp 768 ×47；expert_bias F32[128]；embed / lm_head [141568,2048]</td></tr>
+<tr><td>Whisper fbank encoder + adaptor（hf_model: fbank_encoder.*）</td><td>1.63B</td><td>BF16 3.03 GiB</td><td>conv1 [2048,128,3]、conv2 [2048,2048,3]；32 层 q/k/v/out [2048,2048]（k 无 bias）、fc1 [8192,2048]；adaptor.projection [2048,2048]</td></tr>
+<tr><td>speaker_adaptor（hf_model）</td><td>4.2M</td><td>BF16</td><td>[2048,2048] + bias</td></tr>
+<tr><td>ICL audio_tokenizer（decoder/audio_tokenizer）</td><td>权重文件 3.72B，实际只用 0.47B</td><td>F32</td><td>权重文件含 32 层 encoder + ASR decoder；loader 只取前 9 层 + conv + feat_norm + ssl_proj [128,2048,1] + codebook [1,8192,128]</td></tr>
+<tr><td>FM token2latent（decoder/fm_model）</td><td>0.396B（18 层 blocks 0.34B，其中调制投影 0.115B）</td><td>F32 1.5 GiB，运行时转为部署 dtype</td><td>token_embedding [8193,1024]；acoustic_delay 1 层（带 q/k_norm[64]）；token_proj 2 层（无 q/k_norm）+ shuffle [2048,1024]；input_proj [1024,1152]；conv_embed [1024,64,31]；blocks 带 modulation [6144,1024]；output [64,1024]；start_latent [48,64]；RoPE inv_freq 反推 base≈50000</td></tr>
+<tr><td>Speaker Conformer（decoder/speaker_encoder + speaker_embedding_mapping.pt）</td><td>33M + 0.26M</td><td>F32</td><td>Conv2d [512,1,3,3]、[512,512,3,3]；embed.out [512,9728=512×19]；8 层（FFN [1024,512]、depthwise [512,1,15]、pos_bias_u/v [8,64]）；pool_proj [128,512]；pool_norm γ[256]；mapping Linear(256→1024)</td></tr>
+<tr><td>VAE / BigVGAN（decoder/wavegan）</td><td>decoder 0.115B，encoder 0.032B；flow 0.012B（不加载）</td><td>F32，weight_norm（加载时折叠）</td><td>conv_pre [1536,64,7]；ups [1536,768,10]…[48,24,4]；18 个 resblocks（6 stage × k3/7/11）；conv_post [1,24,7]；encoder 末层 [128,768,3]（=2×Z）；FIR filter 12 taps</td></tr>
+</tbody></table>
+<p><strong>仍由代码决定、权重中不存在的项：</strong>RMSNorm/LayerNorm eps、attention mask 语义、采样策略、sample_rate=24000（wavegan config 未写，配置类补足）、use_vae=true、resblock="1"。FM config 中的 <code>use_flash_attention=false</code>、<code>dropout</code> 等训练字段当前构造不消费，不代表推理后端。</p><p><strong>符号：</strong><code>B</code> 批大小，<code>T</code> 当前序列长度，<code>S</code> 可见 KV 长度，<code>D</code> 隐藏宽度，<code>Hq/Hkv</code> Query/KV 头数，<code>dh</code> 单头宽度。线性层统一用数学写法 <code>XW+b</code>；存储中的权重可能转置。</p><div class="legend"><span class="proj">投影 / 矩阵乘</span><span class="attn">Attention / FA</span><span class="moe">MoE / 路由</span><span class="conv">卷积 / 音频</span><span class="cache">缓存 / 状态</span><span class="opt">NPU 实现映射</span></div><nav id="toc" aria-label="图册目录"></nav></section>
+<div id="diagrams"></div>
+<section class="sources" id="sources"><h2>代码索引与确认边界</h2><p>以下链接相对本页面定位到源码与 <code>tha/hy3_a3b_codec</code> 配置；尺寸由权重 header 核对，但没有执行模型或采集 profiling。本图不能证明融合已在某次服务进程中命中，也不推断 950PR 的实际 kernel 内部分块尺寸。</p><ol id="source-list"></ol></section>
+</main><footer>建议先读总览，再读 Talker / MoE，最后读声学解码。每张图可独立导出为 SVG，供报告排版使用。</footer>
+<script>
+'use strict';
+const NS='http://www.w3.org/2000/svg';
+const SVG_STYLE=`text{font-family:system-ui,-apple-system,'Segoe UI','Noto Sans CJK SC','Microsoft YaHei',sans-serif;fill:#142b42} .title{font-size:16px;font-weight:650}.line{font-size:14px;fill:#3f586e}.edge{fill:none;stroke:#778ea4;stroke-width:1.7;stroke-linejoin:round}.dash{stroke-dasharray:6 4;stroke:#0c8a7d}.edge-label{font-size:12px;fill:#4c6175;paint-order:stroke;stroke:white;stroke-width:5;stroke-linejoin:round}.group-label{font-size:14px;fill:#53697d;font-weight:600}.node rect{stroke-width:1.35}.base rect{fill:#f5f8fc;stroke:#b4c5d5}.proj rect{fill:#eaf3ff;stroke:#77a8dc}.attn rect{fill:#f0ecff;stroke:#a491cf}.moe rect{fill:#fff3df;stroke:#d6ae67}.conv rect{fill:#e8f7f0;stroke:#7db8a0}.cache rect{fill:#fff0f5;stroke:#d99ab2}.opt rect{fill:#e7f8f5;stroke:#50aa9d;stroke-dasharray:5 3}`;
+const diagrams=[];
+const sources=[];
+function n(id,x,y,title,lines=[],kind='base',w=290){return {id,x,y,w,h:54+lines.length*22,title,lines,kind};}
+function e(from,to,fromPort='b',toPort='t',label='',points=[],dash=false){return {from,to,fromPort,toPort,label,points,dash};}
+function group(x,y,w,h,label){return {x,y,w,h,label};}
+function add(id,title,summary,height,nodes,edges,notes=[],refs=[],groups=[]){diagrams.push({id,title,summary,height,nodes,edges,notes,refs,groups});}
+function source(id,path,description,external=false){sources.push({id,path,description,external});}
+
+add('overview','01 · 端到端：两阶段离散 TTS','Talker 预测离散音频索引；Flow Matching 不在 Talker 内，而在第二阶段把索引还原为连续声学 latent。',1020,[
+n('text',40,60,'目标文本 / 可选参考文本',['Tokenizer → 文本 token ID','按训练格式构造 prompt']),
+n('ref',390,60,'参考音频',['分支 A：Whisper 连续特征','分支 B：参考 Codec 索引','分支 C：声学参考条件'],'conv'),
+n('embed',40,255,'Stage 0 · 多模态 Embedding',['文本与音频 ID 共用词表查表','参考连续特征替换占位 embedding','文本/音频位置按 3:3 交织'],'proj'),
+n('llm',40,475,'HunYuan-V3 Talker',['多层 Decoder：Attention + MoE','最后 RMSNorm → lm_head','受约束采样：Codec token / EOS'],'moe'),
+n('cache0',390,475,'LLM 历史 KV',['每层保存历史 K、V','decode 仅为新 token 计算 QKV','NPU 部署 block_size = 128'],'cache'),
+n('transfer',40,695,'SharedMemoryConnector',['只传 Codec 索引与参考/流式元数据','chunk_tokens = 24','lookahead_tokens = 3'],'cache'),
+n('tok',740,255,'Stage 1 · Token Encoder',['Codec embedding / 上采样','Token Processor + Adapter','形成逐帧条件'],'proj'),
+n('fm',740,475,'Chunk-AR Flow Matching',['噪声 x + token/参考/说话人条件','4 步 Euler，linear schedule','MeanFlow 开；CFG alpha = 0'],'attn'),
+n('ref1',1090,60,'首包参考处理',['Speaker Encoder → spkr_emb','VAE Encoder → prefix latent','可复用同内容参考缓存'],'conv'),
+n('kv1',1090,475,'FM 独立 KV 池',['按请求 / 层 / field 评估索引区分','保存参考与历史 chunk 的 KV','不是 Talker 的 KV cache'],'cache'),
+n('wav',740,735,'VAE Decoder / BigVGAN',['连续 latent → 卷积上采样','抗混叠激活 / 残差卷积','流式裁剪 → 24 kHz 波形'],'conv'),
+n('deploy',1090,735,'部署拓扑（当前 YAML）',['Stage 0：卡 0/1/2，3 个副本','Stage 1：卡 3，1 个副本','未配置 TP；不是 TP=3 或 TP=2'],'opt')
+],[e('text','embed'),e('ref','embed','b','r','连续特征 / 参考索引',[[535,218],[350,218],[350,315]]),e('embed','llm'),e('cache0','llm','l','r','历史 K/V',[],true),e('llm','transfer'),e('llm','embed','l','l','下一个 AR 步',[[20,535],[20,315]],true),e('transfer','tok','r','l','流式到达',[[680,755],[680,315]]),e('tok','fm'),e('ref','ref1','r','l','同一参考音频'),e('ref1','fm','b','r','参考条件',[[1235,390],[1055,390],[1055,535]],true),e('fm','kv1','r','l','写入 / 读取',[],true),e('fm','wav')],[['两种自回归','Stage 0 按 token 自回归；Stage 1 按声学 chunk 自回归。每个 chunk 内还有多次 ODE field 评估，三者不能当成同一个循环。'],['参考分支不是每步重算','参考编码通常在首包/缓存未命中时执行。要分析首音延迟与稳态耗时时，需要分开统计。'],['仅配置映射','图中的 3+1 拓扑、采样步数和图开关来自当前 YAML；实际启动参数仍可能覆盖这些值。']],['pipeline','deploy','config']);
+
+add('reference','02 · Talker 参考音频：连续特征、Speaker Token、离散 ICL','这三类条件最终都是 embedding 行；不存在额外的 LLM cross-attention。Whisper 连续特征与 ICL tokenizer 使用独立的 encoder 实例。',1240,[
+n('audio',40,60,'参考 waveform',['16 kHz；有效长度随请求变化'],'conv'),
+n('mel',40,255,'Whisper log-mel',['Hann STFT：n_fft=400 / hop=160','功率谱 → mel filterbank → log10','floor = max(log_spec, peak−8)','归一化 (log_spec + 4) / 4'],'conv'),
+n('enc',40,500,'Fbank Audio Encoder',['Conv/GELU ×2 → 正弦绝对位置','32 个 Encoder blocks → LayerNorm','100 Hz → 25 Hz；D=2048'],'attn'),
+n('adapt',40,750,'连续 Token Adaptor（文本模式）',['每 4 帧 mean pooling','projection：Linear(2048→2048)','25 Hz → 6.25 Hz；本配置不用 concat'],'proj'),
+n('spkr',390,750,'Talker Speaker Token（零样本）',['对 encoder hidden 做 masked mean','speaker_adaptor：Linear 2048→2048','绕过连续 token adaptor'],'proj'),
+n('merge',390,1010,'多模态输入合并',['按请求模式替换对应占位行','文本与 Codec ID → embed_tokens','合并后进入 HYV3 Decoder'],'proj'),
+n('mel2',740,255,'ICL analysis log-mel',['独立分支：fixed floor = −7','不是 Whisper 的 peak−8 floor'],'conv'),
+n('enc2',740,500,'独立 Analysis Encoder',['同类 Conv + Transformer，独立权重','全片 Attention：chunk_size=0','layer=8 → 仅前 9 个 blocks','不执行末尾 encoder.layer_norm'],'attn'),
+n('vqproj',740,750,'VQ 前投影',['feat_norm：LayerNorm(D)，启用','ssl_proj：Conv1d(D→128,k1)','得到连续 VQ feature'],'proj'),
+n('vq',1090,750,'单 Codebook 最近邻量化',['8192×128 codebook；距离计算 FP32','argmin → codec index','不是 FSQ / 不是多级 RVQ'],'proj'),
+n('id',1090,1010,'参考离散音频 ID',['裁至 floor(mel_length / 4)','index + 121000','查 model.embed_tokens → ICL 行'],'proj'),
+n('defaults',1090,255,'hy3_a3b_codec 权重核对',['Whisper：128 mel / D=2048','32 blocks / 32 heads / FFN=8192','ICL：9 blocks / VQ8192×128'],'cache')
+],[e('audio','mel'),e('audio','mel2','r','t','同一波形',[[885,100]]),e('mel','enc'),e('enc','adapt'),e('enc','spkr','r','t','同一 encoder 输出',[[535,550]]),e('adapt','merge','b','l','fbank 行',[[185,1070]]),e('spkr','merge'),e('mel2','enc2'),e('enc2','vqproj'),e('vqproj','vq','r','l'),e('vq','id'),e('id','merge','l','r','ICL embedding')],[['输入布局','文本/音频按 3:3 位置布局交织。参考条件替换占位 embedding，音频离散 ID 使用扩展词表；不是把 mel 直接送进 MoE router。'],['两个 speaker 概念','本图的 speaker token 属于 Talker；图 10 的 Conformer speaker embedding 属于声学 FM。二者网络和用途不同。'],['请求模式与 ICL','三条输入路径不同时启用：零样本音频输出用 Whisper speaker token；带参考转录的 ICL 用离散参考 codes、不再插 speaker token；带参考音频的文本输出才用 fbank 行。ICL 配置确认 layer8+1=9、单码本8192×128，经 index+121000 查 LLM embedding，不存在 VQ128→hidden2048 的额外投影。']],['talker','whisper','tokenizer']);
+
+add('whisper','03 · Whisper Encoder Block：QKV、Attention、MLP 与残差','下图展开连续参考编码的 Transformer。ICL analysis 使用同类 encoder，但 mask、截断层数与 final norm 配置不同。',1320,[
+n('x',40,60,'输入参考 mel [B,T,F]',['F=128 mel bins；conv1 权重 [2048,128,3]'],'conv'),
+n('conv',40,250,'前端卷积 + 位置',['Conv1 F→D,k3,stride 1 或 2 → GELU','Conv2 D→D,k3,stride 2 → GELU','加 sinusoidal absolute position'],'conv'),
+n('ln1',40,500,'self_attn_layer_norm',['LayerNorm(D)','送入以下 Q / K / V 三条投影'],'base'),
+n('q',390,250,'q_proj',['Linear(D→D, bias=True)','reshape [B,H,T,dh]'],'proj'),
+n('k',740,250,'k_proj',['Linear(D→D, bias=False)','reshape [B,H,T,dh]'],'proj'),
+n('v',1090,250,'v_proj',['Linear(D→D, bias=True)','reshape [B,H,T,dh]'],'proj'),
+n('att',740,500,'Self-Attention',['softmax(QKᵀ / sqrt(dh) + M)V','M：64-frame chunk 内双向','可看左侧 10 个 chunks（config）'],'attn'),
+n('out',740,730,'out_proj',['拼接 heads → [B,T,D]','Linear(D→D, bias=True)'],'proj'),
+n('add',390,730,'Attention 残差相加',['u = x + out_proj(attention)','x 为进入此 block 的 hidden'],'base'),
+n('ln2',390,930,'final_layer_norm',['LayerNorm(D)'],'base'),
+n('fc1',740,930,'fc1 → GELU',['Linear(D→Ffn, bias=True)','D=2048 / Ffn=8192；共 32 层'],'proj'),
+n('fc2',1090,930,'fc2',['Linear(Ffn→D, bias=True)'],'proj'),
+n('add2',390,1140,'MLP 残差 → 下一个 block',['y = u + fc2(GELU(fc1(LN(u))))','所有 blocks 后再 encoder.layer_norm'],'base'),
+n('info',40,930,'没有这些操作',['没有 RoPE','没有 Q/K RMSNorm','没有 SwiGLU / MoE'],'cache')
+],[e('x','conv'),e('conv','ln1'),e('ln1','q','r','t','归一化 hidden',[[355,550],[355,220],[535,220]]),e('ln1','k','r','t','',[[355,550],[355,200],[885,200]]),e('ln1','v','r','t','',[[355,550],[355,180],[1235,180]]),e('q','att','b','l','Q',[[535,560]]),e('k','att','b','t','K'),e('v','att','b','r','V',[[1235,560]]),e('att','out'),e('out','add','l','r'),e('conv','add','l','l','block 输入 x',[[20,310],[20,790]],true),e('add','ln2'),e('ln2','fc1','r','l'),e('fc1','fc2','r','l'),e('fc2','add2','b','r','',[[1235,1200]]),e('add','add2','l','l','残差 u',[[360,790],[360,1200]],true)],[['Scale 的实现差异','源码可把缩放拆到 Q/K 上，数学上仍等价于 1/√dh。图不要求一定存在独立 scale kernel。'],['Conv 的因果性','前端为左 padding causal convolution（use_causal_conv=true）。Transformer 的 chunk mask 不等于严格逐 token causal mask。']],['whisper','tokenizer']);
+
+add('talker','04 · HYV3 Talker Decoder：GQA 与完整投影尺寸','hy3_a3b_codec 权重：48 层、H2048、词表141568（q_proj [4096,2048]、k/v_proj [512,2048]）。关键点：Hq×dh=4096，Q 总宽度不等于 hidden size；不按 hybrid_patterns 误算为96层。',1510,[
+n('x',40,60,'输入 x [N,H]',['N 为本步 packed token 数','H=2048'],'base'),
+n('norm',40,250,'input_layernorm',['RMSNorm(H, eps=1e−5)'],'base'),
+n('qkv',390,250,'qkv_proj：合并 Q/K/V GEMM',['QKVParallelLinear，bias=False','H → (Hq + 2Hkv)·dh','2048 → 4096+512+512'],'proj'),
+n('q',390,480,'Q 分支',['split → [N,32,128]','q_norm：逐头 RMSNorm(128)','再 RoPE(Q, position)'],'proj'),
+n('k',740,480,'K 分支',['split → [N,4,128]','k_norm：逐头 RMSNorm(128)','再 RoPE(K, position)'],'proj'),
+n('v',1090,480,'V 分支',['split → [N,4,128]','无 QK norm / 无 RoPE'],'proj'),
+n('cache',1090,730,'Paged KV Cache（每层）',['写入本步旋转后的 K 和 V','保留历史 K/V，不缓存历史 Q','block table + 序列长度'],'cache'),
+n('att',740,730,'GQA / Causal Attention',['32 个 Q heads 共享 4 个 KV heads','scale = 1 / sqrt(128)','当前 Q 看可见历史 + 当前 K/V'],'attn'),
+n('op',740,960,'o_proj',['合并 heads：[N,4096]','RowParallelLinear 4096→2048','bias=False → [N,H]'],'proj'),
+n('add',390,960,'Attention 残差',['u = x + Attention(RMSNorm(x))'],'base'),
+n('post',390,1150,'post_attention_layernorm',['RMSNorm(H)'],'base'),
+n('ffn',740,1150,'Dense FFN 或 MoE',['layer_idx < first_k_dense_replace','layer 0：Dense，M=6912','layer 1..47：MoE，见图 05'],'moe'),
+n('out',390,1350,'FFN 残差 / 下一层',['y = u + FFN(RMSNorm(u))','最后：model.norm → lm_head'],'base'),
+n('rope',40,730,'RoPE 规则',['先 Q/K RMSNorm，再 RoPE','NeoX style；θ=1075835','TP 时头数按分片/复制规则处理'],'cache'),
+n('head',1090,1150,'lm_head 与采样',['独立 FP32 untied Linear 2048→141568','Codec ID ∈ [121000,129192)','布局条件满足时另允许 audio_end'],'proj')
+],[e('x','norm'),e('norm','qkv','r','l'),e('qkv','q'),e('qkv','k','b','t','K',[[535,430],[885,430]]),e('qkv','v','r','t','V',[[1235,310]]),e('q','att','b','l','Q',[[535,790]]),e('k','cache','b','l','K',[[885,675],[1040,675],[1040,790]]),e('v','cache'),e('cache','att','l','r','K / V'),e('att','op'),e('op','add','l','r'),e('x','add','l','l','残差 x',[[20,110],[20,1010]],true),e('add','post'),e('post','ffn','r','l'),e('ffn','out','b','r','',[[885,1400]]),e('add','out','l','l','残差 u',[[355,1010],[355,1400]],true),e('out','head','r','b','仅最后一层之后',[[1235,1400]])],[['逻辑残差与执行残差','源码层间传递 (hidden_states,residual)，FFN 后加法延后到下一层 input_layernorm，末层在 model.norm 合并。本图画数学等价网络，未漏掉残差。'],['音频采样并非总取物理上一行','交织布局中，Codec 采样使用上一 audio-stream 行（BOCA 或 audio）的 anchor hidden；不能简单标成“永远取最后一个文本位置”。'],['Compact head 是实现优化','逻辑上仍为训练得到的独立 lm_head；NPU 可只投影所需候选词表行。合法范围及强制 token 由布局状态控制。']],['talker','backbone','hyconfig']);
+
+add('moe','05 · MoE：选择偏置、TopK、SwiGLU、Shared Expert 与 Combine','hy3_a3b_codec 权重：E=128、K=8、expert M=768（6016 组 gate/up/down）、shared S=1、route_scale=2.826、route_norm=true、expert_bias F32。MoE 不在每个 token 上执行所有 128 个 routed experts。',1490,[
+n('x',40,60,'输入 z [N,H]',['来自 post_attention_layernorm','H=2048；47 个 MoE 层'],'moe'),
+n('router',40,280,'mlp.gate / Router Linear',['Wrouter：H→E，无 Linear bias','router_logits = zWrouter','通常 FP32，存在特殊执行分支'],'proj'),
+n('sig',40,500,'sigmoid → scores s',['sᵢ = sigmoid(router_logitsᵢ)','当前实现不是 softmax router'],'moe'),
+n('sel',390,500,'仅用于选择的修正偏置',['selectionᵢ = sᵢ + expert_biasᵢ','TopK(selection,K) → expert IDs','group=1：从全部 E 个专家选 K'],'moe'),
+n('weight',390,750,'Gather 原始 s → 混合权重',['wᵢ = α·sᵢ / Σⱼ∈I sⱼ','route_norm=False 则 wᵢ=α·sᵢ','expert_bias 不进入混合权重'],'moe'),
+n('dispatch',740,500,'Dispatch / 按专家重排',['每 token 的 z 路由给 K 个专家','生成 expert IDs、行映射、计数','保存逆映射供 combine 使用'],'moe'),
+n('gate',740,750,'每个选中 expert：gate_proj',['H→M，无 bias','g = SiLU(zWgate)'],'proj'),
+n('up',1090,750,'每个选中 expert：up_proj',['H→M，无 bias','u = zWup'],'proj'),
+n('mul',740,960,'SwiGLU × down_proj',['elementwise：g ⊙ u','down_proj：M→H，无 bias','实现 w13 合并 gate/up；w2 是 down'],'proj'),
+n('combine',740,1190,'Unpermute / Weighted Combine',['按逆映射还原 token 顺序','routed(z) = Σᵢ∈I wᵢ · Expertᵢ(z)'],'moe'),
+n('shared',1090,280,'Shared Expert：所有 token',['gate_up_proj：H→2(M·S)','SiLU(gate) ⊙ up','down_proj：M·S→H','不参加 TopK；没有额外 shared gate'],'proj'),
+n('out',1090,1190,'相加 → MoE 输出',['MoE(z) = routed(z) + shared(z)','随后由 Decoder 加外层残差'],'moe'),
+n('dense',40,1000,'Dense 前缀层不是 MoE',['同样使用 SwiGLU','但中间维度是 dense M=6912','没有 router / dispatch / combine'],'cache')
+],[e('x','router'),e('router','sig'),e('sig','sel','r','l'),e('sig','weight','b','l','原始 scores',[[185,810]]),e('sel','weight'),e('sel','dispatch','r','l','expert IDs'),e('x','dispatch','r','t','复制/重排输入 z',[[885,120]]),e('x','shared','r','t','shared 分支输入 z',[[1235,120]]),e('dispatch','gate'),e('dispatch','up','r','t','z',[[1235,560]]),e('gate','mul'),e('up','mul','b','r','up',[[1235,1020]]),e('mul','combine'),e('weight','combine','b','l','w',[[535,1240]]),e('combine','out','r','l'),e('shared','out','r','r','shared 输出',[[1400,350],[1400,1240]])],[['Bias 最容易画错','expert_bias 是 sigmoid 之后的选择修正，不是 router Linear bias。最终路由权重从未加修正偏置的 scores 中提取。'],['Shared 与 Dense','S 个 shared experts 用一个加宽 FFN 实现；S=0 才删除此分支。第 0 层 dense 不等于一个 shared expert，两者处于不同位置。'],['NPU 与并行边界','当前 YAML 为多个单卡 Talker 副本，图中不强加 all-to-all。EP/TP 才需按其实现补通信；shared 多 stream 重叠也不改变上述相加依赖。']],['backbone','router','hyconfig']);
+
+add('token-fm','07 · Codec → FM 条件：Token Encoder、SequenceShuffle 与时间条件','hy3_a3b_codec 权重：D1024/Z64/U2/C48、词表8192、token 层数 1+2、FM 18 层；token_proj 无 q/k_norm 权重，位置卷积 [1024,64,31]，RoPE base≈50000。',1590,[
+n('id',40,60,'Codec indices [B,N]',['token_embedding：(V+1)→D','V=8192；权重 [8193,1024]，末行为 mask'],'proj'),
+n('delay',40,300,'acoustic_delay_transformer',['1 层；16 heads；FFN=4096','无 adaLN；QK LayerNorm 开','仅本 token chunk + lookahead 可见'],'attn'),
+n('tokproj',40,550,'token_proj 的 Transformer',['2 层；严格逐 token causal','16 heads；FFN=4096；无 q/k_norm 权重','无 adaLN；GELU approximate=tanh'],'attn'),
+n('shuffle',40,800,'SequenceShuffle(U=2)',['LayerNorm(D) → Linear(D,U·D)','[B,N,U·D] → reshape [B,N·U,D]','通道展开折入时间轴，不是插值'],'proj'),
+n('cond',390,800,'latent_cond [B,T,Z]',['参考 prefix / 前一预测 chunk','shift_latent：右移一个 chunk','首块使用 learned start_latent'],'cache'),
+n('noise',740,800,'ODE 状态 xₜ [B,T,Z]',['每个求解窗口从 FP32 高斯噪声开始','后续 field 评估使用更新后的 x'],'base'),
+n('concat',390,1040,'通道拼接 → 输入投影',['concat[token_hidden,latent_cond,xₜ]','Linear(D+2Z → D, bias=True)','1152 → 1024'],'proj'),
+n('pos',390,1270,'位置卷积残差',['h ← h + GELU(GroupedConv1d(h))','k31 / groups16（权重 [1024,64,31]）','每个 evaluation 有独立 conv history'],'conv'),
+n('fm',740,1270,'FM Transformer ×L_fm',['18 层；每层独立 adaLN 参数','逐块 Attention + FFN','见图 08'],'attn'),
+n('final',1090,1270,'FinalLayer → velocity',['LN(no affine) → scale/shift','Linear(D→Z, bias=True)','无 residual gate / 无输出激活'],'proj'),
+n('t',390,60,'TimeEmbed(t)',['sinusoidal 256 维：cos 后接 sin','Linear(256,D) → SiLU → Linear(D,D)'],'proj'),
+n('r',740,60,'独立 RTimeEmbed(r)',['结构同 TimeEmbed，权重独立','meanflow：r = |times[1]−times[0]|','4 步 linear 对应 r=0.25'],'proj'),
+n('s',1090,60,'Speaker 条件 g',['spkr_emb → speaker_mapping','Linear(spkr_dim→D)'],'proj'),
+n('sum',740,300,'c = Time(t) + RTime(r) + g',['不是把标量 t+r 一起 embedding','也不是把 speaker 当额外 token'],'base'),
+n('mod',740,550,'每层独立调制投影',['block：SiLU(c) → Linear(D,6D)','final：SiLU(c) → Linear(D,2D)','可缓存并跨 chunk 复用'],'proj')
+],[e('id','delay'),e('delay','tokproj'),e('tokproj','shuffle'),e('shuffle','concat','b','l','token_hidden',[[185,1100]]),e('cond','concat'),e('noise','concat','b','r','xₜ',[[885,1100]]),e('concat','pos'),e('pos','fm','r','l'),e('fm','final','r','l'),e('t','sum','b','l','Time(t)',[[535,360]]),e('r','sum'),e('s','sum','b','r','g',[[1235,360]]),e('sum','mod'),e('mod','fm','r','t','6D / 层',[[1055,610],[1055,1220],[885,1220]],true),e('mod','final','r','t','2D',[[1235,610]],true)],[['Token Transformer 内部','无调制 pre-norm：x←x+Attention(LN(x))；x←x+Linear₂(GELU(Linear₁(LN(x))))。QKV/o_proj 与图 08 同类，但 token_proj 关闭 QK norm。'],['Lookahead 的准确范围','acoustic_delay_transformer 的 query 属于 [lo,lo+K) 时，只能看 [lo,lo+K+lookahead)，不是全部历史 token。K=24、lookahead=3。'],['Token 与 FM 的缓存不同','token encoder 对就绪的 token 历史重新编码；FM 的按 ODE evaluation 区分的 KV cache 不能直接视为 token encoder 的 KV。']],['flow','dit','loader']);
+
+add('fm-block','08 · FM Transformer Block：adaLN、QKV、RoPE、FIA、FFN','本图为有 modulation 的 FM block。D=1024、heads=16、dh=64、FFN=4096；token encoder 的无调制 block 不含这些 scale/shift/gate。',1770,[
+n('x',40,60,'输入 h [B,T,D]',['来自 input projection / 上一层'],'base'),
+n('mod',740,60,'本层 adaLN 参数',['SiLU(c) → Linear(D,6D)','split：shift_a,scale_a,gate_a','shift_f,scale_f,gate_f'],'proj'),
+n('ln',40,300,'LN1 + Attention 调制',['LayerNorm eps=1e−6，无 affine','a = LN1(h)·(1+scale_a)+shift_a','调制运算保持 FP32'],'base'),
+n('qkv',390,300,'qkv_proj',['Linear(D→3D, bias=False)','1024→3072（加载时合并 q/k/v）','split / reshape 为 Q,K,V'],'proj'),
+n('q',390,540,'Q：每头 LayerNorm → RoPE',['q_norm：LN(dh), affine, eps=1e−5','RoPE 使用绝对位置 + 历史偏移','QK norm / 旋转按 FP32 计算'],'proj'),
+n('k',740,540,'K：每头 LayerNorm → RoPE',['k_norm：LN(dh), affine, eps=1e−5','NeoX RoPE；base=50000（inv_freq 反推）','完成后转换至 Attention dtype'],'proj'),
+n('v',1090,540,'V：无需归一化或旋转',['[B,T,16,64]','Q/K/V 头数相同：普通 MHA'],'proj'),
+n('kv',1090,790,'按 evaluation 分离的 KV',['scatter 当前 K、V 到 page','读同一 evaluation 的历史块','包含参考 prefix + 当前 chunk'],'cache'),
+n('att',740,790,'FM Attention / NPU FIA',['softmax(QKᵀ / sqrt(dh) + M)V','块内双向；块间因果','本块 Q 可见历史块和整个本块'],'attn'),
+n('outproj',740,1030,'o_proj',['concat heads → [B,T,D]','Linear(D→D, bias=True)'],'proj'),
+n('gatea',390,1030,'Attention 输出 gate + 残差',['u = h + gate_a · o_proj(attn)','gate 不乘在 Q、K、V 上'],'base'),
+n('ln2',390,1260,'LN2 + FFN 调制',['LayerNorm eps=1e−6，无 affine','f = LN2(u)·(1+scale_f)+shift_f'],'base'),
+n('fc1',740,1260,'FFN Linear₁ → GELU',['Linear(D→4D, bias=True)','GELU(approximate=none)'],'proj'),
+n('fc2',1090,1260,'FFN Linear₂',['Linear(4D→D, bias=True)','不是 SwiGLU / 不是 MoE'],'proj'),
+n('gatef',390,1490,'FFN 输出 gate + 残差',['y = u + gate_f · FFN(f)','残差累加保持 FP32'],'base'),
+n('final',740,1490,'仅整个堆栈最后：FinalLayer',['LN(y)·(1+scale_final)+shift_final','Linear(D→Z) → velocity','final 没有 gate'],'proj')
+],[e('x','ln'),e('ln','qkv','r','l'),e('mod','ln','l','t','shift_a / scale_a',[[700,120],[700,230],[185,230]],true),e('qkv','q'),e('qkv','k','b','t','K',[[535,475],[885,475]]),e('qkv','v','r','t','V',[[1235,360]]),e('q','att','b','l','Q',[[535,850]]),e('k','kv','b','l','K',[[885,715],[1050,715],[1050,850]]),e('v','kv'),e('kv','att','l','r','K/V'),e('att','outproj'),e('outproj','gatea','l','r'),e('x','gatea','l','l','h',[[20,110],[20,1085]],true),e('gatea','ln2'),e('ln2','fc1','r','l'),e('fc1','fc2','r','l'),e('fc2','gatef','b','r','FFN(f)',[[1235,1435],[700,1435],[700,1545]]),e('gatea','gatef','l','l','u',[[355,1085],[355,1545]],true),e('gatef','final','r','l','堆栈结束时')],[['调制参数的另外四路','图顶端同一个 6D 投影同时提供 gate_a、shift_f、scale_f、gate_f，分别用于对应名称的框；为避免四条长交叉线，参数以同名引用标注。'],['QK norm 类型不同','Talker 使用每头 RMSNorm；FM 使用每头 LayerNorm。两者都先归一化再 RoPE，但不是同一种算子。'],['三种 mask 不可混淆','Talker 逐 token causal；FM chunk-causal；token acoustic-delay 本块+lookahead。FIA 的 KV 长度/掩码更新必须保持各自语义。']],['dit','flow','fm-kv']);
+
+add('solver','09 · 双重循环：Chunk-AR 外循环 × 4 步 Euler 内循环','当前部署为 Euler / linear / 4 steps / MeanFlow=true / CFG alpha=0。权重配置 reverse_time=true、shift_latent=true、use_r_time_embedder=true，结合此部署配置得到图中时间网格。',1280,[
+n('arrive',40,60,'新 Codec tokens 到达',['等待 chunk + lookahead 就绪','24 token → 48 latent frames（0.96 s）','EOF 可处理短尾块'],'cache'),
+n('token',40,300,'编码就绪 token 历史',['token_embedding → delay Transformer','token_proj → SequenceShuffle','取当前窗口需要的 token_hidden'],'proj'),
+n('init',390,300,'构造本次求解窗口',['FP32 x ~ N(0,I)','latent_cond：参考 / prev_chunk','首窗可能含参考前缀 + 第一新块'],'base'),
+n('time',740,60,'时间网格与 MeanFlow',['t = [1,.75,.5,.25,0]','dt = −0.25；r = |dt| = 0.25','reverse_time=true（权重配置）'],'cache'),
+n('field',390,550,'幅度处理 → field evaluation',['先对 field 输入做可选 dynamic_thr','输入投影 / 位置卷积 / FM×18','FinalLayer → velocity vᵢ'],'attn'),
+n('update',390,790,'Euler 状态更新',['x ← x + (tᵢ₊₁−tᵢ) · vᵢ','i=0..3：一共 4 次 field','幅度处理发生在 field 输入侧'],'base'),
+n('cache',740,550,'独立的 cache 流',['请求 × evaluation × layer × branch','4 步条件分支 → 4 套评估状态','同一评估跨 chunk 保存历史 K/V'],'cache'),
+n('history',740,790,'conv history / 长度提交',['每个 evaluation 有自己的位置卷积历史','整窗完成后提交 KV 有效长度','下一 chunk 复用同一 eval 历史'],'cache'),
+n('latent',390,1040,'得到新 normalized latent',['保留 prev_chunk 供下一块条件','参考 prefix 不直接输出','z_raw = z·global_std + global_mean'],'conv'),
+n('decode',740,1040,'流式 BigVGAN 解码',['保存 latent 左上下文','等待所需右上下文 → 解码 → 裁剪','EOF flush 剩余波形'],'conv'),
+n('cfg',1090,300,'CFG=0 的含义',['只运行条件 field 分支','token / speaker 条件仍然存在','没有 unconditional 双分支扩 batch'],'opt')
+],[e('arrive','token'),e('token','init','r','l'),e('init','field'),e('time','field','b','t','tᵢ,r',[[885,245],[695,245],[695,505],[535,505]],true),e('field','update'),e('update','field','l','l','下一 Euler step',[[355,850],[355,610]],true),e('cache','field','l','r','同一 eval 的 K/V',[],true),e('cache','history'),e('update','latent','b','t','4 步完成'),e('latent','decode','r','l'),e('latent','arrive','l','l','下一声学 chunk',[[20,1100],[20,110]],true)],[['为什么需要 4 套 KV','不同 ODE 时间的 hidden / K / V 不相同。第 1 次 evaluation 的 KV 不能给第 2 次当成历史；跨 chunk 重用的是相同 evaluation 编号的状态。'],['动态幅度处理','配置默认打开 dynamic_thr，并依据参考 prefix 的幅度统计重缩放状态；无参考时须禁用。图中的 Euler 公式是积分核心，不代表整个 solver 只剩一次加法。'],['开销分析应分开计数','一次服务请求、一次 token decode、一次声学 chunk、一次 field evaluation、一次 Transformer block，是五种不同统计单位。']],['flow','fm-kv','vocoder','deploy']);
+
+add('acoustic-ref','10A · 声学参考条件：VAE Encoder 与 Conformer Speaker Encoder','两条支路在首包/缓存未命中时运行，分别提供参考 prefix latent 和 FM 调制条件。尺寸按 hy3_a3b_codec 的 wavegan/speaker 权重确认；Speaker 使用 stat_pool，而不是默认 mean_pool。',1460,[
+n('wav',40,60,'参考 waveform',['按各分支配置重采样','同内容参考可使用缓存'],'conv'),
+n('enc0',40,300,'VAE Encoder 前端',['右补零到 hop 整数倍','Conv1d(1→12,k3)','LeakyReLU(0.2)'],'conv'),
+n('down',40,560,'6 个下采样阶段',['strides = [2,2,2,3,4,5]','channels：12→24→48→96','→192→384→768'],'conv'),
+n('stats',40,820,'输出 posterior statistics',['Conv1d(768→2Z,k3)','split：[μ, log_std]','z = μ + ε·exp(log_std)'],'proj'),
+n('normz',40,1080,'参考 prefix latent',['转成 [B,T,Z]','(z−global_mean) / global_std','送入 FM 参考条件与幅度统计'],'base'),
+n('downblock',390,560,'每个下采样 stage',['Conv1d stride=s,k=2s','ResStack：6 个顺序残差单元','LeakyReLU(0.2)'],'conv'),
+n('res',390,820,'ResStack 单元 i=0..5',['LeakyReLU(0.01) → Conv k3,d=2ⁱ','LeakyReLU(0.01) → Conv k3,d=1','加回本单元输入'],'conv'),
+n('mel',740,300,'Speaker log-mel',['24 kHz / 80 mel bins','n_fft=1024 / hop=240','输出 [B,T,80]'],'conv'),
+n('sub',740,560,'Conv2dSubsampling4',['Conv2d(1→512,k3,s2) → ReLU','Conv2d(512→512,k3,s2) → ReLU','展平 channel×frequency'],'conv'),
+n('proj',740,820,'输入投影 + 位置编码',['Linear(512×19→512)','relative-position encoding','Conformer blocks ×8，见图 10B'],'proj'),
+n('pool',740,1080,'统计池化 stat_pool',['after_norm → 每帧 Linear(512→128)','concat(masked mean128,std128)','256 维 → RMSNorm(256)'],'proj'),
+n('mapping',1090,1080,'speaker_mapping',['Linear(256→1024)','g_cond 加到 time/r embeddings','speaker_embedding_mapping.pt'],'proj'),
+n('diff',1090,560,'不是 Talker Speaker Token',['本支路是独立 Conformer','不是图 02 的 Whisper hidden mean','只服务 Stage 1 声学 FM 条件'],'cache')
+],[e('wav','enc0'),e('enc0','down'),e('down','stats'),e('stats','normz'),e('down','downblock','r','l','展开',[],true),e('downblock','res'),e('wav','mel','r','t','同一参考',[[885,115]]),e('mel','sub'),e('sub','proj'),e('proj','pool'),e('pool','mapping','r','l')],[['VAE 不是固定取均值','该参考路径使用 posterior 采样；statistics 第二半是 log_std 而不是 log_variance。复现误差时需要同时控制参考采样与 solver 噪声。'],['权重与缺省字段','权重确认 Z=64、hop480、speaker width512/8层/FFN1024/stat_pool256。wavegan 缺省 use_vae=true、resblock=1、sample_rate24000 由当前配置类补足。'],['没有额外 flow 网络','BigVGANFlowVAE 名称中的 flow 在此推理实现不构建。不要在已经画出的 Chunk-AR FM 和 BigVGAN 之间再加一个 Flow 模型。']],['vocoder','vae','speaker','conformer','loader']);
+
+add('conformer','10B · Speaker Conformer：相对位置 Attention、卷积模块、FFN','hy3_a3b_codec speaker：8 blocks、宽度 512、8 heads、FFN1024。不是 Macaron 双 FFN 结构；执行顺序为 Attention → ConvModule → FFN → final norm。',1620,[
+n('x',40,60,'输入 x [B,T,512]',['来自 Conv2d subsampling + projection'],'base'),
+n('ln',40,300,'norm_mha',['LayerNorm → a'],'base'),
+n('q',390,300,'linear_q',['Linear(512→512, bias=True)','reshape 8 heads ×64'],'proj'),
+n('k',740,300,'linear_k',['Linear(512→512, bias=True)','reshape 8 heads ×64'],'proj'),
+n('v',1090,300,'linear_v',['Linear(512→512, bias=True)','reshape 8 heads ×64'],'proj'),
+n('p',740,60,'linear_pos / 相对位置支路',['Linear(512→512, bias=False)','pos_emb → P；learned u,v biases'],'proj'),
+n('att',740,560,'相对位置 Attention',['scores = ((Q+u)Kᵀ + (Q+v)Pᵀ)','scores / sqrt(dh) + padding mask','softmax(scores) · V'],'attn'),
+n('op',390,560,'linear_out + 残差',['concat heads → Linear(512→512)','u₁ = x + linear_out(attn)'],'proj'),
+n('conv',390,810,'norm_conv → ConvModule',['LN(u₁) → Pointwise Conv 512→1024','GLU → Depthwise Conv k15,groups512','LayerNorm → SiLU → Pointwise 512→512'],'conv'),
+n('addc',390,1070,'卷积残差',['u₂ = u₁ + ConvModule(LN(u₁))'],'base'),
+n('ffn',740,1070,'norm_ff → FFN',['LN(u₂) → w_1：Linear(512→1024)','SiLU → w_2：Linear(1024→512)','u₃ = u₂ + FFN(LN(u₂))'],'proj'),
+n('out',740,1330,'norm_final → 下一 block',['LayerNorm(u₃)','所有 blocks 后另有 after_norm'],'base'),
+n('detail',1090,810,'卷积与 mask 细节',['Depthwise：对称 padding=7','内部是 LayerNorm，不是 BatchNorm','对 padding / boundary 做有效性屏蔽'],'cache'),
+n('npu',1090,1330,'NPU 分支的实现',['显式 QK matmul + bias + softmax','再乘 V，保持相同注意力公式','此处不直接等同于 FM 的 FIA'],'opt')
+],[e('x','ln'),e('ln','q','r','l'),e('ln','k','r','t','a',[[355,350],[355,250],[885,250]]),e('ln','v','r','t','a',[[355,350],[355,220],[1235,220]]),e('q','att','r','l','Q',[[710,349],[710,620]]),e('k','att','b','t','K'),e('v','att','b','r','V',[[1235,620]]),e('p','att','r','r','P 与 u,v',[[1400,120],[1400,710],[1060,710],[1060,620]],true),e('att','op','l','r'),e('x','op','l','l','x',[[20,110],[20,615]],true),e('op','conv'),e('conv','addc'),e('op','addc','l','l','u₁',[[355,615],[355,1120]],true),e('addc','ffn','r','l'),e('ffn','out')],[['相对位置不是 RoPE','本实现把 (Q+v)Pᵀ 作为 additive attention bias，与 (Q+u)Kᵀ 相加。不能把该位置支路画成 Q/K 旋转。'],['卷积模块顺序','Pointwise Conv → GLU → Depthwise Conv → LayerNorm → SiLU → Pointwise Conv；每一操作都保留其真实位置。'],['可并行不等于可替换','NPU 的显式 attention 写法用于满足图录制约束。是否可进一步融合，需要保持 relative bias 与 mask 语义。']],['conformer','speaker']);
+
+add('bigvgan','11 · BigVGAN Decoder：上采样、AMPBlock、SnakeBeta 与 FIR','wavegan 权重确认 6 个上采样 stage，总倍数 5×4×3×2×2×2=480。sample_rate 未写入 config，由代码补为24 kHz，每 latent frame 对应 20 ms。',1800,[
+n('z',40,60,'FM normalized latent',['z_raw = z·global_std + global_mean','转为 [B,Z,T]'],'base'),
+n('pre',40,290,'conv_pre',['Conv1d(Z→1536,k7)','明确 non-causal'],'conv'),
+n('stages',40,540,'6 个上采样 stages',['stride：5 / 4 / 3 / 2 / 2 / 2','kernel：10 / 8 / 6 / 4 / 4 / 4','channels：1536→768→384→192','→96→48→24'],'conv'),
+n('up',390,290,'每 stage：ConvTranspose1d',['通道减半，时间按 stride 扩展','随后进入三个并行 AMPBlock'],'conv'),
+n('b3',390,540,'AMPBlock：kernel=3',['顺序 dilation=[1,3,5]','每个 dilation 含两次 AA-Act + Conv'],'conv'),
+n('b7',740,540,'AMPBlock：kernel=7',['顺序 dilation=[1,3,5]','输入相同，各自独立权重'],'conv'),
+n('b11',1090,540,'AMPBlock：kernel=11',['顺序 dilation=[1,3,5]','输入相同，各自独立权重'],'conv'),
+n('avg',740,790,'三分支平均',['(stage_k3 + stage_k7 + stage_k11)/3','送入下一个上采样 stage'],'base'),
+n('unit',390,1020,'AMPBlock 的单个 dilation 单元',['a₁ = AA-Act(x) → Conv(k,d)','a₂ = AA-Act(a₁) → Conv(k,1)','y = x + a₂；再进入下一 dilation'],'conv'),
+n('firup',740,1020,'AA-Act 第一步：上采样',['FIR low-pass / upsample ×2','filter 12 taps（权重 [1,1,12]）'],'conv'),
+n('snake',1090,1020,'SnakeBeta',['f(x) = x + sin²(αx)/(β+ε)','逐通道可学习 α、β','logscale 配置可用 exp 参数化'],'conv'),
+n('firdown',1090,1280,'AA-Act 最后：下采样',['FIR low-pass / downsample ÷2','抗混叠；恢复输入时间分辨率'],'conv'),
+n('postact',40,1280,'6 stages 后的 activation_post',['同一 AA-Act / SnakeBeta 结构'],'conv'),
+n('post',390,1280,'conv_post',['Conv1d(24→1,k7)','无 bias（use_bias_at_final=false）'],'conv'),
+n('clamp',390,1520,'输出幅度限制',['clamp[-1,1]','use_tanh_at_final=True 才用 tanh'],'base'),
+n('stream',740,1520,'流式裁剪 → waveform',['用 latent history + 左右上下文解码','裁出当前应输出的 sample 范围','不是逐层卷积 feature cache'],'cache')
+],[e('z','pre'),e('pre','stages'),e('stages','up','r','l','展开一个 stage',[[355,600],[355,345]],true),e('up','b3'),e('up','b7','b','t','并行',[[535,470],[885,470]]),e('up','b11','r','t','并行',[[1235,345]]),e('b3','avg','b','l','',[[535,845]]),e('b7','avg'),e('b11','avg','b','r','',[[1235,845]]),e('b3','unit','l','t','展开残差单元',[[355,595],[355,965],[535,965]],true),e('unit','firup','r','l','展开 AA-Act',[],true),e('firup','snake','r','l'),e('snake','firdown'),e('stages','postact','l','l','全部 stages 完成',[[20,610],[20,1335]]),e('postact','post','r','l'),e('post','clamp'),e('clamp','stream','r','l')],[['时间换算','上下采样乘积均为 480，24 kHz 对应 50 latent frames/s；结合 U=2 得到 25 codec tokens/s，一个 FM chunk（48 帧）= 0.96 s。'],['不是每个 stage 只做一个卷积','每 stage 有 3 个 AMPBlock，每块有 3 个残差单元，每单元 2 次卷积与 2 次 AA-Act；最后还有 activation_post。'],['Causal 的例外','主体卷积 causal、activation causal，但 conv_pre 显式 non-causal。实际流式处理需保留足够左右 latent 上下文。']],['vae','hyconfig','vocoder']);
+
+add('fa','06 · FA 如何工作：分块 Attention，而不是新的注意力公式','本图是 FlashAttention 的数学等价计算原理。Ascend FIA 是推理融合算子接口；这里不把通用原理冒充为闭源 kernel 的真实指令/流水实现。',1220,[
+n('q',40,60,'输入 Query',['Q : [B, Hq, T, dh]','来自投影 + 可选 QNorm/RoPE'],'proj'),
+n('kv',390,60,'输入 Key / Value',['K,V : [B, Hkv, S, dh]','连续张量或分页 KV + block table'],'cache'),
+n('rule',740,60,'头映射与可见范围',['GQA：多组 Q 头共享一个 KV 头','Mask 由所属网络决定','缩放通常为 1 / sqrt(dh)'],'attn'),
+n('block',40,280,'固定一个 Query tile Qᵢ',['片上保留 Qᵢ 与行统计量','初始化 m = −∞，l = 0，O = 0'],'attn'),
+n('load',390,280,'逐块读取 Kⱼ / Vⱼ',['不要求把整个 KV 放到片上','分页布局按 block table 取数'],'cache'),
+n('score',390,490,'小块 Score 矩阵',['Sᵢⱼ = Qᵢ Kⱼᵀ / sqrt(dh) + M','只生成当前 tile 的 score'],'proj'),
+n('softmax',390,700,'Online Softmax 行统计',['m′ = max(m, rowmax(Sᵢⱼ))','P = exp(Sᵢⱼ − m′)','a = exp(m − m′)'],'attn'),
+n('acc',740,700,'更新归一化分母与分子',['l′ = a · l + rowsum(P)','O′ = a · O + P Vⱼ','m,l,O ← m′,l′,O′'],'proj'),
+n('done',740,955,'完成全部可见 KV tiles',['Attention output = O / l','拼接 Query heads','后续 output projection 是另一层'],'attn'),
+n('why',1090,280,'节省的是 HBM 读写',['不把完整 T × S 的 score / P','写回 HBM 再读入','不是把 Attention 变成稀疏模型'],'opt'),
+n('masks',1090,700,'本模型的 mask 不相同',['Talker：因果 + 历史 KV','Whisper：参考长度 / 分块规则','FM：chunk 历史 + chunk 内可见'],'base')
+],[e('q','block'),e('kv','load'),e('load','score'),e('block','score','b','l','Qᵢ',[[185,550]]),e('rule','score','b','r','mask / head mapping',[[885,450],[710,450],[710,550]],true),e('score','softmax'),e('softmax','acc','r','l','m′, P, a'),e('load','acc','r','t','Vⱼ',[[885,340]]),e('acc','done'),e('acc','load','r','r','还有下一块 K/V',[[1050,760],[1050,340]],true)],[['不改变数学目标','结果仍是 softmax(QKᵀ / sqrt(dh) + M)V，浮点舍入顺序可能不同。QKV 投影、RoPE、输出投影不应默认都算进 FA kernel。'],['Prefill 与 decode','Prefill 中 T 较长，避免 T×S 中间矩阵十分重要；decode 中 T 常很短，还要关注 KV/权重读取、小矩阵效率和调度开销。'],['Mask 与数值边界','公式按行广播；实现须处理全 mask 行、padding 和不同序列长度。FM 当前块不是逐 token causal，不能照搬 LLM 的三角 mask。']],['dit','whisper','backbone']);
+
+add('npu-map','12 · 逻辑算子与当前 NPU 实现的对应关系','这是源码和部署配置中的实现选择图，不是一次 profiling 的实测执行图。图录制、融合与多 stream 不改变模型的逻辑数据依赖。',1010,[
+n('a',40,60,'参考 Whisper 编码',['LayerNorm / Q、K、V 投影','Attention / 残差 / MLP'],'base'),
+n('b',40,300,'Talker Decoder 与采样',['MoE 路由 / Experts / Shared Expert','lm_head / logits / sampler'],'base'),
+n('c',40,540,'FM 求解与分页 Attention',['token 编码 → 多次 field 评估','归一化 / QKV / KV 更新 / FIA'],'base'),
+n('d',40,780,'VAE / BigVGAN',['Snake 激活','抗混叠 FIR 重采样'],'base'),
+n('ao',450,60,'Fbank 融合请求',['tts_codec_fbank_qkv = true','tts_codec_fbank_add_norm = true','逻辑 Q、K、V 仍分别存在'],'opt',400),
+n('bo',450,300,'MoE / Head / Host 优化请求',['shared expert 多 stream 重叠','compact_head / small_dispatch/combine','logits fusion / async scheduling'],'opt',400),
+n('co',450,540,'图录制与 KV 优化请求',['token encoder / 整段 chunk solve 入图','kv_scatter / kv_metadata_cache = true','fused_rope_fp32 = false'],'opt',400),
+n('do',450,780,'音频融合请求',['snake_fusion = true，require = true','fir_fusion = true，require = false','是否安装仍受 dtype / 模块检查约束'],'opt',400),
+n('gate',1030,60,'安装顺序与条件',['权重加载后 → fusion installer','再初始化 / 录制 NPUGraph','总开关和模块匹配决定可用性'],'cache',340),
+n('legacy',1030,540,'注意新的 FM modulation 路径',['检测到 field_modulations 时','禁用部分 legacy codec wrappers','不能把 YAML 的 true 当成已融合'],'cache',340)
+],[e('a','ao','r','l'),e('b','bo','r','l'),e('c','co','r','l'),e('d','do','r','l'),e('gate','ao','l','r','安装条件',[],true),e('legacy','co','l','r','路径守卫',[],true)],[['为什么单独画执行映射','把 QKV 合并为一次 GEMM，不等于网络没有三个投影；把整段 ODE 录成图，也不等于只执行一次 Transformer。'],['950PR 确认范围','当前图只刻画 Ascend NPU 软件路径；硬件 tile、Cube/Vector 重叠、真实融合命中与耗时须由运行日志及 profiling 确认。'],['历史数据不可直接套用','以当前未提交工作区代码为准。旧报告/旧 YAML 中的优化项可能被新 modulation 路径替换或禁用。']],['installer','runner','deploy']);
+
+source('pipeline','vllm_omni/model_executor/models/uniditar_tts_codec/pipeline.py','UNIDITAR_TTS_CODEC_PIPELINE：Talker / Code2Wav 两阶段。');
+source('deploy','vllm_omni/deploy/uniditar_tts_codec.yaml','当前工作区部署配置：3+1 副本、24+3 connector、4 步 Euler、NPU 开关。');
+source('config','vllm_omni/transformers_utils/configs/uniditar_tts_codec.py','TTSCodecUniDiTARConfig：词表、参考缓存、MeanFlow、动态图与步数参数。');
+source('installer','vllm_omni/platforms/npu/ops/uniditar_installer.py','prepare_uniditar_npu_fusions：模块匹配、迁移开关、新旧 FM modulation 路径守卫。');
+source('runner','vllm_omni/platforms/npu/worker/npu_model_runner.py','OmniNPUModelRunner.load_model：先装融合，再初始化自定义图。');
+source('talker','vllm_omni/model_executor/models/uniditar_tts_codec/uniditar_tts_codec_talker.py','TTSCodecUniDiTARTalker：HYV3 骨干、独立 lm_head、多模态 embedding 与音频 anchor。');
+source('backbone','vllm/vllm/model_executor/models/hunyuan_v3.py','HYV3Attention / HYV3DecoderLayer / HYV3MoEFused：QKV、每头 RMSNorm、RoPE、路由与延迟残差。',true);
+source('router','vllm/vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py','GroupedTopKRouter：sigmoid scores、选择偏置、原始分数归一化；NPU 需保持等价路由语义。',true);
+source('hyconfig','vllm_omni/transformers_utils/configs/uniditar_tts3.py','HYV3LLMConfig 与 BigVGANFlowVAEConfig：config 未写字段（如 sample_rate、use_vae）的缺省来源。');
+source('whisper','vllm_omni/model_executor/models/uniditar_tts_codec/whisper_fbank_encoder.py','WhisperFbankEncoder / HunYuanAudioEncoder：log-mel、卷积、chunk mask、QKV、adaptor。');
+source('tokenizer','vllm_omni/model_executor/models/uniditar_tts_codec/audio_tokenizer.py','TTSCodecAudioTokenizer：独立 analysis encoder、feat_norm、ssl_proj、单 codebook 最近邻量化。');
+source('flow','vllm_omni/model_executor/models/uniditar_tts_codec/token2wav/flow_matching.py','ChunkArToken2LatentFlowMatching：token 编码、MeanFlow、field_modulations、solver 与 chunk 状态。');
+source('dit','vllm_omni/model_executor/models/uniditar_tts_codec/token2wav/modeling_dit.py','MultiHeadAttention / TransformerBlock / FinalLayer / SequenceShuffle：FM 算子细节。');
+source('fm-kv','vllm_omni/model_executor/models/uniditar_tts_codec/token2wav/paged_kv_cache.py','paged_attention：chunk-causal 可见范围、KV 写入与分页读取。');
+source('vocoder','vllm_omni/model_executor/models/uniditar_tts_codec/token2wav/vocoder.py','参考 latent 与 speaker 提取、global_mean/std、流式 decoder 接口。');
+source('loader','vllm_omni/model_executor/models/uniditar_tts_codec/uniditar_tts_codec_loader.py','按 &lt;model&gt;/../decoder 加载 FM/VAE/speaker/audio_tokenizer；ICL tokenizer 只取前 layer+1 层。');
+source('vae','vllm_omni/model_executor/models/uniditar_tts3/audio_vae.py','TTS-Codec 复用的 BigVGANFlowVAE / _AMPBlock1 / _Activation1d / _BigVGANEncoder。');
+source('speaker','vllm_omni/model_executor/models/uniditar/speaker_encoder.py','ConformerSpeakerEncoder：log-mel、Conformer、每帧投影、pooling 与最终归一化。');
+source('conformer','vllm_omni/model_executor/models/uniditar/conformer.py','RelPositionMultiHeadedAttention / ConvolutionModule / ConformerEncoderLayer。');
+source('checkpoint-llm','hy3_a3b_codec/hf_model/config.json','模型权重 config：48层、H2048、词表141568、Codec窗口与 MoE 参数。',true);
+source('checkpoint-whisper','hy3_a3b_codec/hf_model/audio_encoder/config.json','audio_config/adaptor_config：32层 Whisper、pooling4。伴随 text_config 的96层不属于此 Talker。',true);
+source('checkpoint-icl','hy3_a3b_codec/decoder/audio_tokenizer/config.json','ICL：layer8+1=9、feat_norm、单码本8192×128；实际实现以当前 loader 为准，不按类名猜 WavLM。',true);
+source('checkpoint-fm','hy3_a3b_codec/decoder/fm_model/config.json','FM：1024/64、token1+2层、FM18层、U2/chunk48。当前构造不消费 use_flash_attention/dropout 等遗留字段。',true);
+source('checkpoint-vae','hy3_a3b_codec/decoder/wavegan/config.json','VAE/BigVGAN：上/下采样、通道数、SnakeBeta、AMP kernels。use_vae/resblock/sample_rate 缺省由代码补足。',true);
+source('checkpoint-speaker','hy3_a3b_codec/decoder/speaker_encoder/config.json','Speaker：Conformer8层、FFN1024、stat_pool、model_dim256；与 Python 默认6层/mean_pool/192不同。',true);
+const checkpointRefs={overview:['checkpoint-llm','checkpoint-fm'],reference:['checkpoint-whisper','checkpoint-icl'],whisper:['checkpoint-whisper'],talker:['checkpoint-llm'],moe:['checkpoint-llm'],'token-fm':['checkpoint-fm','checkpoint-speaker'],'fm-block':['checkpoint-fm'],solver:['checkpoint-fm'],'acoustic-ref':['checkpoint-vae','checkpoint-speaker'],conformer:['checkpoint-speaker'],bigvgan:['checkpoint-vae']};
+for(const d of diagrams)d.refs.push(...(checkpointRefs[d.id]||[]));
+
+function el(tag,attrs={},text){const x=document.createElementNS(NS,tag);for(const [k,v] of Object.entries(attrs))x.setAttribute(k,String(v));if(text!==undefined)x.textContent=text;return x;}
+function port(node,side){return side==='t'?[node.x+node.w/2,node.y]:side==='b'?[node.x+node.w/2,node.y+node.h]:side==='l'?[node.x,node.y+node.h/2]:[node.x+node.w,node.y+node.h/2];}
+function svgFor(d){const svg=el('svg',{xmlns:NS,viewBox:`0 0 1420 ${d.height}`,width:1420,height:d.height,role:'img','aria-labelledby':`${d.id}-title`});svg.append(el('title',{id:`${d.id}-title`},d.title),el('desc',{},d.summary),el('style',{},SVG_STYLE),el('rect',{width:1420,height:d.height,fill:'#fff'}),el('text',{x:24,y:28,class:'title'},d.title));const defs=el('defs');const marker=el('marker',{id:`${d.id}-arrow`,viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:7,markerHeight:7,orient:'auto-start-reverse'});marker.append(el('path',{d:'M 0 0 L 10 5 L 0 10 z',fill:'#778ea4'}));defs.append(marker);svg.append(defs);for(const g of d.groups){svg.append(el('rect',{x:g.x,y:g.y,width:g.w,height:g.h,rx:12,fill:'#fafbfd',stroke:'#dce5ed','stroke-dasharray':'5 4'}),el('text',{x:g.x+14,y:g.y+23,class:'group-label'},g.label));}
+const map=new Map(d.nodes.map(x=>[x.id,x]));for(const edge of d.edges){const a=map.get(edge.from),b=map.get(edge.to);if(!a||!b)throw new Error(`${d.id}: bad edge ${edge.from}/${edge.to}`);const start=port(a,edge.fromPort),end=port(b,edge.toPort);let points=[start,...edge.points,end];if(!edge.points.length&&start[0]!==end[0]&&start[1]!==end[1]){points=['t','b'].includes(edge.fromPort)?[start,[start[0],(start[1]+end[1])/2],[end[0],(start[1]+end[1])/2],end]:[start,[(start[0]+end[0])/2,start[1]],[(start[0]+end[0])/2,end[1]],end];}svg.append(el('path',{d:points.map((p,i)=>`${i?'L':'M'} ${p[0]} ${p[1]}`).join(' '),class:`edge${edge.dash?' dash':''}`,'marker-end':`url(#${d.id}-arrow)`}));if(edge.label){let best=0,index=0;for(let i=0;i<points.length-1;i++){let len=Math.hypot(points[i+1][0]-points[i][0],points[i+1][1]-points[i][1]);if(len>best){best=len;index=i;}}const p=points[index],q=points[index+1];svg.append(el('text',{x:(p[0]+q[0])/2+5,y:(p[1]+q[1])/2-8,class:'edge-label','text-anchor':p[1]===q[1]?'middle':'start'},edge.label));}}
+for(const node of d.nodes){const g=el('g',{class:`node ${node.kind}`});const fit=(text,size)=>{const estimate=Array.from(text).reduce((sum,ch)=>sum+(ch.charCodeAt(0)>255?1:0.59)*size,0);return estimate>node.w-30?{textLength:node.w-30,lengthAdjust:'spacingAndGlyphs'}:{};};g.append(el('rect',{x:node.x,y:node.y,width:node.w,height:node.h,rx:9}),el('text',{x:node.x+15,y:node.y+29,class:'title',...fit(node.title,16)},node.title));node.lines.forEach((line,i)=>g.append(el('text',{x:node.x+15,y:node.y+55+i*22,class:'line',...fit(line,14)},line)));svg.append(g);}return svg;}
+function html(tag,className,text){const x=document.createElement(tag);if(className)x.className=className;if(text!==undefined)x.textContent=text;return x;}
+function render(){diagrams.sort((a,b)=>a.title.localeCompare(b.title));const root=document.getElementById('diagrams');for(const d of diagrams){const a=html('a','',d.title.split(' · ')[0]+' '+d.title.split(' · ')[1].split('：')[0]);a.href='#'+d.id;document.getElementById('toc').append(a);const panel=html('section','panel');panel.id=d.id;panel.append(html('h2','',d.title),html('p','sub',d.summary));const tools=html('div','toolbar');const label=html('label','','缩放 ');const slider=html('input');slider.type='range';slider.min='70';slider.max='180';slider.value='100';slider.setAttribute('aria-label',d.title+'缩放');label.append(slider);const value=html('span','','100%');const download=html('button','','导出 SVG');download.type='button';tools.append(label,value,download);const canvas=html('div','canvas');const svg=svgFor(d);canvas.append(svg);slider.addEventListener('input',()=>{svg.style.width=slider.value+'%';value.textContent=slider.value+'%';});download.addEventListener('click',()=>{const copy=svg.cloneNode(true);copy.removeAttribute('style');const blob=new Blob(['<?xml version="1.0" encoding="UTF-8"?>\n'+new XMLSerializer().serializeToString(copy)],{type:'image/svg+xml;charset=utf-8'});const url=URL.createObjectURL(blob);const link=html('a');link.href=url;link.download='tts_codec_'+d.id+'.svg';document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),2000);});panel.append(tools,canvas);const notes=html('div','notes');for(const [title,text] of d.notes){const note=html('div','note');note.append(html('strong','',title),html('p','',text));notes.append(note);}panel.append(notes);const refs=html('div','source-links','实现索引：');for(const ref of d.refs){const link=html('a','',ref);link.href='#src-'+ref;refs.append(link);}panel.append(refs);root.append(panel);}for(const s of sources){const li=html('li');li.id='src-'+s.id;const link=html('a');link.href=(s.external?'../../../../':'../../../')+s.path;link.append(html('code','',s.path));li.append(link,html('small','',s.description));document.getElementById('source-list').append(li);}}
+globalThis.codecDiagrams=diagrams;globalThis.codecSources=sources;globalThis.svgFor=svgFor;
+if(typeof document!=='undefined')render();
+</script>
+</body>
+</html>
